@@ -1416,11 +1416,10 @@ public:
 
         const auto total_tokens = static_cast<size_t>(key_layout.get_partial_shape()[0].get_length());
         const auto rounded_tokens = ceil_div(total_tokens, tile_tokens) * tile_tokens;
-        const auto padded_tokens = rounded_tokens + tile_tokens;
         const auto key_row_pitch = static_cast<size_t>(key_pitches[0]);
         const auto key_bitwidth = ov::element::Type(key_layout.data_type).bitwidth();
         const auto key_row_bytes = (key_row_pitch * key_bitwidth + 7) / 8;
-        return key_layout.bytes_count() + (padded_tokens - total_tokens) * key_row_bytes;
+        return key_layout.bytes_count() + (rounded_tokens - total_tokens) * key_row_bytes;
     }
 
     size_t get_query_block_size(const PagedAttentionStage& stage, const bool use_micro_sdpa) const {
@@ -1649,7 +1648,7 @@ public:
          *              [block_idx0, subsequence_idx0, block_idx1, subsequence_idx0, ..., block_idx0, subsequence_idx1].
          *              Filled in paged_attention_inst::on_execute() call for sdpa-micro kernel only.
          * 4          - Padded copy of the raw key input for the sdpa-micro prefill kernel. It rounds the
-         *              allocation up to KQ wg_tile_m rows and appends one guard tile so block K loads stay in bounds.
+         *              allocation up to KQ wg_tile_m rows so block K loads stay in bounds at the final partial tile.
          */
 
         std::vector<BufferDescriptor> internal_buffers;
