@@ -413,6 +413,10 @@ void PagedAttention::execute([[maybe_unused]] const dnnl::stream& strm) {
 bool PagedAttention::isSupportedOperation(const std::shared_ptr<const ov::Node>& op,
                                           std::string& errorMessage) noexcept {
     try {
+        if (op->get_input_size() > 28) {
+            errorMessage = "PagedAttention prefix K/V update is not supported by the CPU plugin.";
+            return false;
+        }
         auto vCachePrecision = op->get_input_element_type(PagedAttentionExecutor::ID_VCACHE);
         auto kCachePrecision = op->get_input_element_type(PagedAttentionExecutor::ID_KCACHE);
         if (any_of(vCachePrecision,

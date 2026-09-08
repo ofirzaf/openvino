@@ -82,8 +82,8 @@ void PagedAttentionExtension::validate_and_infer_types() {
     OV_OP_SCOPE(PagedAttentionExtension_validate_and_infer_types);
 
     NODE_VALIDATION_CHECK(this,
-                          get_input_size() == 28,
-                          "PagedAttensionExtension expects 28 inputs, but it has ",
+                          get_input_size() == 28 || get_input_size() == 31,
+                          "PagedAttentionExtension expects 28 legacy inputs or 31 inputs with prefix K/V, but it has ",
                           get_input_size());
 
     // format: Node*, input_idx, name, {rank_list}, {type_list}
@@ -116,6 +116,60 @@ void PagedAttentionExtension::validate_and_infer_types() {
     input_check(this, 25, "token_type_ids", {1, 2}, {element::i32});
     input_check(this, 26, "qq_bias", {1}, {element::u8});
     input_check(this, 27, "qq_bias_begins", {1}, {element::i32});
+    if (get_input_size() == 31) {
+        input_check(this, 28, "prefix_key", {2}, {});
+        input_check(this, 29, "prefix_value", {2}, {});
+        input_check(this, 30, "prefix_subsequence_begins", {1}, {element::i32});
+
+        const auto& prefix_key_shape = get_input_partial_shape(28);
+        const auto& prefix_value_shape = get_input_partial_shape(29);
+        const auto& prefix_key_type = get_input_element_type(28);
+        const auto& prefix_value_type = get_input_element_type(29);
+        const auto& key_type = get_input_element_type(1);
+        const auto& value_type = get_input_element_type(2);
+        NODE_VALIDATION_CHECK(this,
+                              prefix_key_type.is_dynamic() || key_type.is_dynamic() || prefix_key_type == key_type,
+                              "Prefix key element type must match key, got ",
+                              prefix_key_type,
+                              " and ",
+                              key_type,
+                              ".");
+        NODE_VALIDATION_CHECK(
+            this,
+            prefix_value_type.is_dynamic() || value_type.is_dynamic() || prefix_value_type == value_type,
+            "Prefix value element type must match value, got ",
+            prefix_value_type,
+            " and ",
+            value_type,
+            ".");
+        NODE_VALIDATION_CHECK(this,
+                              prefix_key_shape.rank().is_dynamic() || prefix_value_shape.rank().is_dynamic() ||
+                                  prefix_key_shape[0].compatible(prefix_value_shape[0]),
+                              "Prefix key and value token dimensions must be compatible, got ",
+                              prefix_key_shape,
+                              " and ",
+                              prefix_value_shape,
+                              ".");
+
+        const auto& key_shape = get_input_partial_shape(1);
+        const auto& value_shape = get_input_partial_shape(2);
+        NODE_VALIDATION_CHECK(this,
+                              prefix_key_shape.rank().is_dynamic() || key_shape.rank().is_dynamic() ||
+                                  prefix_key_shape[1].compatible(key_shape[1]),
+                              "Prefix key feature dimension must be compatible with key, got ",
+                              prefix_key_shape,
+                              " and ",
+                              key_shape,
+                              ".");
+        NODE_VALIDATION_CHECK(this,
+                              prefix_value_shape.rank().is_dynamic() || value_shape.rank().is_dynamic() ||
+                                  prefix_value_shape[1].compatible(value_shape[1]),
+                              "Prefix value feature dimension must be compatible with value, got ",
+                              prefix_value_shape,
+                              " and ",
+                              value_shape,
+                              ".");
+    }
 
     const auto input_shapes = ov::util::get_node_input_partial_shapes(*this);
     const auto output_shapes = shape_infer(this, input_shapes);

@@ -25,6 +25,8 @@ public:
                                          PagedAttentionInputIdx::XATTENTION_THRESHOLD,
                                          PagedAttentionInputIdx::XATTENTION_BLOCK_SIZE,
                                          PagedAttentionInputIdx::MAX_CONTEXT_LEN };
+        if (typed_desc()->has_prefix_kv)
+            input_ports.insert(PagedAttentionInputIdx::PREFIX_SUBSEQUENCE_BEGINS);
 
         if (typed_desc()->has_score_aggregation)
             input_ports.insert(PagedAttentionInputIdx::SCORE_AGGREGATION);
@@ -85,6 +87,15 @@ public:
     memory::ptr adaptive_rkv_diversity_block_set_indices_begins_memory_ptr() const { return input_memory_ptr(PagedAttentionInputIdx::ADAPTIVE_RKV_DIVERSITY_BLOCK_SET_INDICES_BEGINS); }
     memory::ptr qq_bias_memory_ptr() const { return input_memory_ptr(PagedAttentionInputIdx::QQ_BIAS); }
     memory::ptr qq_bias_begins_memory_ptr() const { return input_memory_ptr(PagedAttentionInputIdx::QQ_BIAS_BEGINS); }
+    memory::ptr prefix_key_memory_ptr() const {
+        return input_memory_ptr(PagedAttentionInputIdx::PREFIX_KEY);
+    }
+    memory::ptr prefix_value_memory_ptr() const {
+        return input_memory_ptr(PagedAttentionInputIdx::PREFIX_VALUE);
+    }
+    memory::ptr prefix_subsequence_begins_memory_ptr() const {
+        return input_memory_ptr(PagedAttentionInputIdx::PREFIX_SUBSEQUENCE_BEGINS);
+    }
 };
 
 using paged_attention_inst = typed_primitive_inst<paged_attention>;

@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <cstring>
 #include <intel_gpu/primitives/activation.hpp>
 #include <intel_gpu/primitives/data.hpp>
 #include <intel_gpu/primitives/eltwise.hpp>
@@ -18,7 +19,6 @@
 #include <openvino/core/except.hpp>
 #include <openvino/reference/adaptive_rkv_diversity.hpp>
 #include <openvino/reference/xattention.hpp>
-#include <cstring>
 #include <optional>
 
 #include "openvino/runtime/properties.hpp"
@@ -58,6 +58,9 @@
  * [20]: adaptive_rkv_diversity_block_set_indices_begins, optional, shape: [batch_size_in_sequences + 1], type: i32
  * [21]: qq_bias, optional, shape: [total_mask_size], type: u8
  * [22]: qq_bias_begins, optional, shape: [batch_size_in_sequences + 1], type: i32
+ * [28]: prefix_key, optional, shape: [prefix_tokens, num_kv_heads * key_head_size], type: f16
+ * [29]: prefix_value, optional, shape: [prefix_tokens, num_kv_heads * value_head_size], type: f16
+ * [30]: prefix_subsequence_begins, optional, shape: [batch_size_in_sequences + 1], type: i32
  */
 
 enum class ScoresMode { DISABLED = 0, LAST_TOKEN, SNAPKV };
@@ -133,6 +136,13 @@ struct PagedAttentionManager {
 
     // optional token_type_ids; when empty, a default single-element {0} buffer is used
     std::vector<int> token_type_ids;
+
+    // Optional committed-prefix K/V rows. past_lens includes these rows, while
+    // prefix_subsequence_begins describes their packed input ranges.
+    std::vector<ov::float16> prefix_key_data;
+    std::vector<ov::float16> prefix_value_data;
+    std::vector<int> prefix_subsequence_begins;
+
     cldnn::engine& test_engine;
     cldnn::stream& test_stream;
     tests::random_generator& rg;
@@ -231,6 +241,29 @@ struct PagedAttentionManager {
         }
     }
 
+    void set_prefix_lengths(const std::vector<int>& prefix_lengths) {
+        OPENVINO_ASSERT(prefix_lengths.size() == subsequence_descs.size());
+        prefix_key_data.clear();
+        prefix_value_data.clear();
+        prefix_subsequence_begins.assign(1, 0);
+
+        for (size_t seq_idx = 0; seq_idx < prefix_lengths.size(); ++seq_idx) {
+            const auto prefix_len = prefix_lengths[seq_idx];
+            const auto effective_past = subsequence_descs[seq_idx].past_len;
+            OPENVINO_ASSERT(prefix_len >= 0 && prefix_len <= effective_past);
+            const auto prefix_start = effective_past - prefix_len;
+
+            const auto key_begin = key_data[seq_idx].begin() + static_cast<size_t>(prefix_start * num_kv_heads * k_head_size);
+            const auto key_end = key_begin + static_cast<size_t>(prefix_len * num_kv_heads * k_head_size);
+            prefix_key_data.insert(prefix_key_data.end(), key_begin, key_end);
+
+            const auto value_begin = value_data[seq_idx].begin() + static_cast<size_t>(prefix_start * num_kv_heads * v_head_size);
+            const auto value_end = value_begin + static_cast<size_t>(prefix_len * num_kv_heads * v_head_size);
+            prefix_value_data.insert(prefix_value_data.end(), value_begin, value_end);
+            prefix_subsequence_begins.push_back(prefix_subsequence_begins.back() + prefix_len);
+        }
+    }
+
     cldnn::memory::ptr get_query_memory() {
         return get_QKV_memory(query_data, num_heads, k_head_size, false);
     }
@@ -241,6 +274,18 @@ struct PagedAttentionManager {
 
     cldnn::memory::ptr get_value_memory() {
         return get_QKV_memory(value_data, num_kv_heads, v_head_size, true);
+    }
+
+    cldnn::memory::ptr get_prefix_key_memory() {
+        return get_packed_QKV_memory(prefix_key_data, num_kv_heads, k_head_size);
+    }
+
+    cldnn::memory::ptr get_prefix_value_memory() {
+        return get_packed_QKV_memory(prefix_value_data, num_kv_heads, v_head_size);
+    }
+
+    cldnn::memory::ptr get_prefix_subsequence_begins_memory() {
+        return get_memory_from_vec(prefix_subsequence_begins);
     }
 
     cldnn::memory::ptr get_key_cache_memory_cm() {
@@ -400,7 +445,8 @@ struct PagedAttentionManager {
         auto key_cache_layout = cldnn::layout{key_cache_shape, key_cache_dt, cldnn::format::bfyx};
         auto memory = test_engine.allocate_memory(key_cache_layout);
         for (int i = 0; i < static_cast<int>(subsequence_descs.size()); i++) {
-            int past_len = subsequence_descs[i].past_len;
+            int past_len = subsequence_descs[i].past_len - get_prefix_length(i);
+            OPENVINO_ASSERT(past_len >= 0);
             if (past_len != 0) {
                 int blocks_num = cldnn::ceil_div(past_len + 1, block_size);
                 int start_block_idx = block_indices[block_indices_begins[i]];
@@ -601,7 +647,8 @@ struct PagedAttentionManager {
         auto memory = test_engine.allocate_memory(value_cache_layout);
 
         for (int i = 0; i < static_cast<int>(subsequence_descs.size()); i++) {
-            const int past_len = subsequence_descs[i].past_len;
+            const int past_len = subsequence_descs[i].past_len - get_prefix_length(i);
+            OPENVINO_ASSERT(past_len >= 0);
             if (past_len == 0)
                 continue;
 
@@ -871,9 +918,13 @@ private:
         for (const auto& subsequence_desc : subsequence_descs)
             total_tokens += subsequence_desc.num_tokens;
 
-        auto query_shape = ov::PartialShape{total_tokens, num_heads * head_size};
+        auto query_shape = ov::PartialShape{std::max(total_tokens, 1), num_heads * head_size};
         auto query_layout = cldnn::layout{query_shape, cldnn::data_types::f16, cldnn::format::bfyx};
         auto memory = test_engine.allocate_memory(query_layout);
+        if (total_tokens == 0) {
+            auto empty_layout = cldnn::layout{ov::PartialShape{0, num_heads * head_size}, cldnn::data_types::f16, cldnn::format::bfyx};
+            return test_engine.reinterpret_buffer(*memory, empty_layout);
+        }
 
         for (int subsequence_idx = 0; subsequence_idx < static_cast<int>(subsequence_descs.size()); subsequence_idx++) {
             for (int token_idx = 0; token_idx < subsequence_descs[subsequence_idx].num_tokens; token_idx++) {
@@ -896,8 +947,27 @@ private:
         return memory;
     }
 
+    cldnn::memory::ptr get_packed_QKV_memory(const std::vector<ov::float16>& input_data, int num_heads, int head_size) {
+        OPENVINO_ASSERT(input_data.size() % (num_heads * head_size) == 0);
+        const auto total_tokens = static_cast<int64_t>(input_data.size() / (num_heads * head_size));
+        auto layout = cldnn::layout{ov::PartialShape{total_tokens, num_heads * head_size}, cldnn::data_types::f16, cldnn::format::bfyx};
+        auto memory = test_engine.allocate_memory(layout);
+        if (!input_data.empty()) {
+            set_values(test_stream, memory, input_data.data(), input_data.size(), 0);
+        }
+        return memory;
+    }
+
+    int get_prefix_length(size_t subsequence_idx) const {
+        if (prefix_subsequence_begins.empty()) {
+            return 0;
+        }
+        OPENVINO_ASSERT(prefix_subsequence_begins.size() == subsequence_descs.size() + 1);
+        return prefix_subsequence_begins[subsequence_idx + 1] - prefix_subsequence_begins[subsequence_idx];
+    }
+
     template <typename T>
-    static void set_values(cldnn::stream& stream, cldnn::memory::ptr mem, T* vals, size_t size, size_t dst_offset) {
+    static void set_values(cldnn::stream& stream, cldnn::memory::ptr mem, const T* vals, size_t size, size_t dst_offset) {
         cldnn::mem_lock<T> mem_ptr(mem, stream);
         for (size_t i = 0; i < size; i++) {
             mem_ptr[dst_offset + i] = vals[i];
@@ -1843,25 +1913,20 @@ public:
         const size_t adjusted_block_size = quantized_values + 2 * sizeof(ov::float16);
         const float expected_inv_scale = zero_range / (is_int4 ? 15.0f : 255.0f);
         const float tolerance = is_int4 ? 1e-5f : 1e-6f;
-        cldnn::mem_lock<uint8_t, cldnn::mem_lock_type::read> cache_bytes(key_cache_mem,
-                                                                         tests::get_test_stream());
+        cldnn::mem_lock<uint8_t, cldnn::mem_lock_type::read> cache_bytes(key_cache_mem, tests::get_test_stream());
 
         for (const int physical_block : pam->block_indices) {
             for (size_t head = 0; head < static_cast<size_t>(p.num_kv_heads); ++head) {
-                const size_t block_head_offset =
-                    (static_cast<size_t>(physical_block) * p.num_kv_heads + head) * p.k_head_size * adjusted_block_size;
+                const size_t block_head_offset = (static_cast<size_t>(physical_block) * p.num_kv_heads + head) * p.k_head_size * adjusted_block_size;
                 for (size_t dim = 0; dim < static_cast<size_t>(p.k_head_size); ++dim) {
                     const size_t scale_offset = block_head_offset + dim * adjusted_block_size + quantized_values;
                     ov::float16 stored_inv_scale;
                     std::memcpy(&stored_inv_scale, cache_bytes.data() + scale_offset, sizeof(stored_inv_scale));
                     const float inv_scale = static_cast<float>(stored_inv_scale);
 
-                    EXPECT_TRUE(std::isfinite(inv_scale))
-                        << "block=" << physical_block << ", head=" << head << ", dim=" << dim;
-                    EXPECT_GT(inv_scale, 0.0f)
-                        << "block=" << physical_block << ", head=" << head << ", dim=" << dim;
-                    EXPECT_NEAR(inv_scale, expected_inv_scale, tolerance)
-                        << "block=" << physical_block << ", head=" << head << ", dim=" << dim;
+                    EXPECT_TRUE(std::isfinite(inv_scale)) << "block=" << physical_block << ", head=" << head << ", dim=" << dim;
+                    EXPECT_GT(inv_scale, 0.0f) << "block=" << physical_block << ", head=" << head << ", dim=" << dim;
+                    EXPECT_NEAR(inv_scale, expected_inv_scale, tolerance) << "block=" << physical_block << ", head=" << head << ", dim=" << dim;
                 }
             }
         }
@@ -1971,6 +2036,15 @@ public:
 
         auto qq_bias = pam.get_qq_bias_memory();
         auto qq_bias_begins = pam.get_qq_bias_begins_memory();
+        const bool has_prefix_kv = !pam.prefix_subsequence_begins.empty();
+        cldnn::memory::ptr prefix_key_mem;
+        cldnn::memory::ptr prefix_value_mem;
+        cldnn::memory::ptr prefix_subsequence_begins_mem;
+        if (has_prefix_kv) {
+            prefix_key_mem = pam.get_prefix_key_memory();
+            prefix_value_mem = pam.get_prefix_value_memory();
+            prefix_subsequence_begins_mem = pam.get_prefix_subsequence_begins_memory();
+        }
         auto query_layout = query_mem->get_layout();
         auto key_layout = key_mem->get_layout();
         auto value_layout = value_mem->get_layout();
@@ -1999,6 +2073,14 @@ public:
         auto token_type_ids_layout = token_type_ids_mem->get_layout();
         auto qq_bias_layout = qq_bias->get_layout();
         auto qq_bias_begins_layout = qq_bias_begins->get_layout();
+        cldnn::layout prefix_key_layout;
+        cldnn::layout prefix_value_layout;
+        cldnn::layout prefix_subsequence_begins_layout;
+        if (has_prefix_kv) {
+            prefix_key_layout = prefix_key_mem->get_layout();
+            prefix_value_layout = prefix_value_mem->get_layout();
+            prefix_subsequence_begins_layout = prefix_subsequence_begins_mem->get_layout();
+        }
 
         // make layouts dynamic
         query_layout.set_partial_shape(ov::PartialShape{-1, p.num_heads * p.k_head_size});
@@ -2030,6 +2112,11 @@ public:
         adaptive_rkv_diversity_block_set_indices_begins_layout.set_partial_shape(ov::PartialShape{-1});
         qq_bias_layout.set_partial_shape(ov::PartialShape{-1});
         qq_bias_begins_layout.set_partial_shape(ov::PartialShape{-1});
+        if (has_prefix_kv) {
+            prefix_key_layout.set_partial_shape(ov::PartialShape{-1, p.num_kv_heads * p.k_head_size});
+            prefix_value_layout.set_partial_shape(ov::PartialShape{-1, p.num_kv_heads * p.v_head_size});
+            prefix_subsequence_begins_layout.set_partial_shape(ov::PartialShape{-1});
+        }
 
         if (p.dynamic_paddings) {
             const auto padding_axis = 1;
@@ -2089,6 +2176,11 @@ public:
                                                     cldnn::input_info("token_type_ids"),
                                                     cldnn::input_info("qq_bias"),
                                                     cldnn::input_info("qq_bias_begins")};
+        if (has_prefix_kv) {
+            pa_inputs.push_back(cldnn::input_info("prefix_key"));
+            pa_inputs.push_back(cldnn::input_info("prefix_value"));
+            pa_inputs.push_back(cldnn::input_info("prefix_subsequence_begins"));
+        }
 
         auto pa_prim = cldnn::paged_attention("paged_attention", pa_inputs);
 
@@ -2166,10 +2258,19 @@ public:
             topology.add(cldnn::input_layout("token_type_ids", token_type_ids_layout));
             topology.add(cldnn::input_layout("qq_bias", qq_bias_layout));
             topology.add(cldnn::input_layout("qq_bias_begins", qq_bias_begins_layout));
+            if (has_prefix_kv) {
+                topology.add(cldnn::input_layout("prefix_key", prefix_key_layout));
+                topology.add(cldnn::input_layout("prefix_value", prefix_value_layout));
+                topology.add(cldnn::input_layout("prefix_subsequence_begins", prefix_subsequence_begins_layout));
+            }
         }
 
         ov::intel_gpu::ExecutionConfig config = tests::get_test_default_config(tests::get_test_engine());
-        config.set_property(ov::intel_gpu::optimize_data(true));
+        const auto proposal_tokens =
+            std::accumulate(pam.subsequence_descs.begin(), pam.subsequence_descs.end(), 0, [](int total, const SubsequenceDescriptor& subsequence) {
+                return total + subsequence.num_tokens;
+            });
+        config.set_property(ov::intel_gpu::optimize_data(proposal_tokens > 0));
         config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
         // FlashAttn v1 or v2?
         config.set_property(ov::intel_gpu::could_use_flashattn_v2(p.force_flashattn_v2 ? true : p.disable_flashattn_v2));
@@ -2207,6 +2308,11 @@ public:
         network->set_input_data("token_type_ids", token_type_ids_mem);
         network->set_input_data("qq_bias", qq_bias);
         network->set_input_data("qq_bias_begins", qq_bias_begins);
+        if (has_prefix_kv) {
+            network->set_input_data("prefix_key", prefix_key_mem);
+            network->set_input_data("prefix_value", prefix_value_mem);
+            network->set_input_data("prefix_subsequence_begins", prefix_subsequence_begins_mem);
+        }
 
         last_key_cache_mem = result.key_cache_mem;
         last_block_indices = pam.block_indices;

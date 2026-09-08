@@ -356,7 +356,8 @@ KERNEL(pa_kv_cache_update)(
     const __global int* blocked_indexes_start,
     const __global int* blocked_indexes_end,
     const __global int* gws_seq_indexes_correspondence,
-    const int is_prefill_stage
+    const int is_prefill_stage,
+    const int is_prefix_update
 ) {
     // If the the number of new tokens equals to the number of past_lens elements,
     // then it's the 2nd+ iteration
@@ -382,17 +383,31 @@ KERNEL(pa_kv_cache_update)(
 
     if (!is_prefill_stage) {
         // 2nd+ token
-        const uint seq_idx = (uint)get_global_id(0);
+        const uint input_token_idx = (uint)get_global_id(0);
+        uint seq_idx = input_token_idx;
+        uint token_idx_in_seq = 0;
+        uint past_seq_len = 0;
+        if (is_prefix_update) {
+            seq_idx = 0;
+            while (input_token_idx >= (uint)subsequence_begins[seq_idx + 1]) {
+                seq_idx++;
+            }
+            const uint seq_begin = (uint)subsequence_begins[seq_idx];
+            const uint prefix_len = (uint)subsequence_begins[seq_idx + 1] - seq_begin;
+            token_idx_in_seq = input_token_idx - seq_begin;
+            past_seq_len = (uint)past_lens[seq_idx] - prefix_len + token_idx_in_seq;
+        } else {
+            past_seq_len = past_lens[seq_idx];
+        }
         const uint head_idx = (uint)get_global_id(1);
         const uint sglid = (uint)get_local_id(2);
 
-        const uint past_seq_len = past_lens[seq_idx];
         const uint current_token_pos_in_block = past_seq_len % PAGED_ATTENTION_BLOCK_SIZE;
         const uint seq_block_idx = block_indices_begins[seq_idx] + past_seq_len / PAGED_ATTENTION_BLOCK_SIZE;
         const uint block_idx = block_indices[seq_block_idx];
 
-        uint key_in_offset = INPUT0_OFFSET + seq_idx * KEY_IN_STRIDE + head_idx * K_HEAD_SIZE;
-        uint value_in_offset = INPUT1_OFFSET + seq_idx * VAL_IN_STRIDE + head_idx * V_HEAD_SIZE;
+        uint key_in_offset = INPUT0_OFFSET + input_token_idx * KEY_IN_STRIDE + head_idx * K_HEAD_SIZE;
+        uint value_in_offset = INPUT1_OFFSET + input_token_idx * VAL_IN_STRIDE + head_idx * V_HEAD_SIZE;
 
         #ifdef IS_KEY_BY_CHANNEL
         uint block_k_base_offset = block_idx * KV_HEADS_NUM * phys_adjusted_k_head_size * ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE + head_idx * phys_adjusted_k_head_size * ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE;

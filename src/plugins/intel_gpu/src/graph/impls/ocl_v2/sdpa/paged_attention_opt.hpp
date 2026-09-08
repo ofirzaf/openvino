@@ -17,17 +17,17 @@ using namespace cldnn;  // TODO: Remove once namespaces are aligned
 
 namespace ov::intel_gpu::ocl {
 
-enum class PagedAttentionStage : uint8_t { GENERATE = 0, PREFILL = 1, MIXED = 2, UNKNOWN = 3 };
+enum class PagedAttentionStage : uint8_t { GENERATE = 0, PREFILL = 1, MIXED = 2, CACHE_UPDATE_ONLY = 3, UNKNOWN = 4 };
 
 struct PagedAttentionRuntimeParams : public ImplRuntimeParams {
-    PagedAttentionStage stage;
-    size_t num_of_partitions;
-    size_t partition_size;
-    size_t max_context_len;
-    size_t paged_attention_aligned_seq_len;
-    size_t sdpa_opt_seq_len_partition_size;
+    PagedAttentionStage stage = PagedAttentionStage::UNKNOWN;
+    size_t num_of_partitions = 0;
+    size_t partition_size = 0;
+    size_t max_context_len = 0;
+    size_t paged_attention_aligned_seq_len = 0;
+    size_t sdpa_opt_seq_len_partition_size = 0;
 
-    size_t paged_attention_snap_kv_tokens;
+    size_t paged_attention_snap_kv_tokens = 0;
     bool use_micro_sdpa = false;
     bool use_gqa_kernel = false;
     size_t query_block_size = 16;
@@ -54,6 +54,15 @@ struct PagedAttentionOpt : public ImplementationManager {
             return false;
         }
 
+        if (desc->has_prefix_kv && (!everyone_is(ov::element::f16,
+                                                 node.get_input_layout(paged_attention::PagedAttentionInputIdx::PREFIX_KEY).data_type,
+                                                 node.get_input_layout(paged_attention::PagedAttentionInputIdx::PREFIX_VALUE).data_type,
+                                                 node.get_input_layout(paged_attention::PagedAttentionInputIdx::KEY_CACHE).data_type,
+                                                 node.get_input_layout(paged_attention::PagedAttentionInputIdx::VALUE_CACHE).data_type))) {
+            GPU_DEBUG_TRACE_DETAIL << "validate_impl() - false because prefix K/V initially supports FP16 only. " << std::endl;
+            return false;
+        }
+
         // OCL PA kernel requires head_size >= 16 (SUBGROUPS_PER_WG = head_size / SUBGROUP_SIZE)
         OPENVINO_ASSERT(desc->k_head_size >= 16 && desc->v_head_size >= 16,
                         "[GPU] OCL PagedAttention kernel does not support head_size < 16."
@@ -72,6 +81,16 @@ struct PagedAttentionOpt : public ImplementationManager {
 
         if (!one_of(k_layout.data_type, supported_kv_types) || !one_of(v_layout.data_type, supported_kv_types)) {
             return false;
+        }
+
+        if (desc->has_prefix_kv) {
+            const auto& prefix_k_layout = node.get_input_layout(paged_attention::PagedAttentionInputIdx::PREFIX_KEY);
+            const auto& prefix_v_layout = node.get_input_layout(paged_attention::PagedAttentionInputIdx::PREFIX_VALUE);
+            const auto& prefix_begins_layout = node.get_input_layout(paged_attention::PagedAttentionInputIdx::PREFIX_SUBSEQUENCE_BEGINS);
+            if (!everyone_is(format::bfyx, prefix_k_layout.format, prefix_v_layout.format) || !one_of(prefix_k_layout.data_type, supported_kv_types) ||
+                !one_of(prefix_v_layout.data_type, supported_kv_types) || prefix_begins_layout.data_type != ov::element::i32) {
+                return false;
+            }
         }
 
         return one_of(q_layout.data_type, supported_q_types) && one_of(out_layout.data_type, supported_q_types);

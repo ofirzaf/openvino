@@ -11,6 +11,201 @@ TEST_P(paged_attention_test, basic) {
     execute(p, p.run_reference);
 }
 
+class paged_attention_prefix_kv_test : public PagedAttentionTest<paged_attention_test_params> {};
+
+TEST_P(paged_attention_prefix_kv_test, matches_reference) {
+    auto p = GetParam();
+    ASSERT_TRUE(this->pam.has_value());
+    auto& pam = *this->pam;
+
+    std::vector<int> prefix_lengths;
+    prefix_lengths.reserve(pam.subsequence_descs.size());
+    for (size_t seq_idx = 0; seq_idx < pam.subsequence_descs.size(); ++seq_idx) {
+        const auto& subsequence = pam.subsequence_descs[seq_idx];
+        const bool exercise_empty_prefix = (pam.subsequence_descs.size() > 1 && seq_idx == 0) || (subsequence.num_tokens == 0 && subsequence.past_len == 1);
+        prefix_lengths.push_back(exercise_empty_prefix ? 0 : std::max(1, subsequence.past_len / 2));
+    }
+    pam.set_prefix_lengths(prefix_lengths);
+
+    auto result = run_gpu_inference(pam, p);
+    {
+        cldnn::mem_lock<ov::float16, cldnn::mem_lock_type::read> key_cache(result.key_cache_mem, tests::get_test_stream());
+        cldnn::mem_lock<ov::float16, cldnn::mem_lock_type::read> value_cache(result.value_cache_mem, tests::get_test_stream());
+        for (size_t seq_idx = 0; seq_idx < pam.subsequence_descs.size(); ++seq_idx) {
+            const auto effective_past = pam.subsequence_descs[seq_idx].past_len;
+            const auto prefix_len = prefix_lengths[seq_idx];
+            const auto old_past = effective_past - prefix_len;
+            for (int token_idx = 0; token_idx < prefix_len; ++token_idx) {
+                const auto cache_pos = old_past + token_idx;
+                const auto block_offset = pam.block_indices_begins[seq_idx] + cache_pos / p.block_size;
+                const auto physical_block = pam.block_indices[block_offset];
+                const auto token_pos = cache_pos % p.block_size;
+                for (int head_idx = 0; head_idx < p.num_kv_heads; ++head_idx) {
+                    for (int dim = 0; dim < p.k_head_size; ++dim) {
+                        const auto source_offset = (static_cast<size_t>(old_past + token_idx) * p.num_kv_heads + head_idx) * p.k_head_size + dim;
+                        const auto cache_offset =
+                            ((static_cast<size_t>(physical_block) * p.num_kv_heads + head_idx) * p.k_head_size + dim) * p.block_size + token_pos;
+                        EXPECT_EQ(key_cache[cache_offset], pam.key_data[seq_idx][source_offset]);
+                    }
+                    for (int dim = 0; dim < p.v_head_size; ++dim) {
+                        const auto source_offset = (static_cast<size_t>(old_past + token_idx) * p.num_kv_heads + head_idx) * p.v_head_size + dim;
+                        const auto cache_offset =
+                            ((static_cast<size_t>(physical_block) * p.num_kv_heads + head_idx) * p.block_size + token_pos) * p.v_head_size + dim;
+                        EXPECT_EQ(value_cache[cache_offset], pam.value_data[seq_idx][source_offset]);
+                    }
+                }
+            }
+        }
+    }
+
+    const auto proposal_tokens =
+        std::accumulate(pam.subsequence_descs.begin(), pam.subsequence_descs.end(), 0, [](int total, const SubsequenceDescriptor& subsequence) {
+            return total + subsequence.num_tokens;
+        });
+    if (proposal_tokens > 0) {
+        const auto reference = PagedAttentionReference(pam).get_reference(result.key_cache_mem);
+        compare(result.outputs.at("output_data").get_memory(), nullptr, nullptr, reference);
+    }
+
+    auto pa_inst = result.network->get_primitive("paged_attention");
+    ASSERT_NE(pa_inst, nullptr);
+    ASSERT_NE(pa_inst->get_impl(), nullptr);
+    const auto dump_info = pa_inst->get_impl()->get_kernels_dump_info(*pa_inst->get_impl_params());
+    const auto prefix_tokens = std::accumulate(prefix_lengths.begin(), prefix_lengths.end(), 0);
+    if (prefix_tokens + proposal_tokens > 0) {
+        EXPECT_NE(dump_info.get_entries().find("pa_kv_cache_update_ref"), std::string::npos)
+            << "Expected prefix and proposal cache update kernels: " << dump_info.get_entries();
+    }
+    if (prefix_tokens > 0 && proposal_tokens == 0) {
+        EXPECT_EQ(dump_info.get_entries().find("sdpa"), std::string::npos)
+            << "Update-only execution must not run an attention stage: " << dump_info.get_entries();
+    }
+
+    if (pam.subsequence_descs.size() == 1 && pam.subsequence_descs[0].num_tokens == 1 && prefix_lengths[0] > 0) {
+        pam.past_lens[0] += prefix_lengths[0];
+        pam.subsequence_begins = {0, 0};
+        result.network->set_input_data("past_lens", pam.get_past_lens_memory());
+        result.network->set_input_data("subsequence_begins", pam.get_subsequence_begins_memory());
+
+        EXPECT_NO_THROW(result.outputs = result.network->execute());
+        const auto transition_dump = pa_inst->get_impl()->get_kernels_dump_info(*pa_inst->get_impl_params()).get_entries();
+        EXPECT_NE(transition_dump.find("pa_kv_cache_update_ref"), std::string::npos)
+            << "Shape-stable update-only transition must execute the prefix writer: " << transition_dump;
+        EXPECT_EQ(transition_dump.find("sdpa"), std::string::npos) << "Shape-stable update-only transition must not execute attention: " << transition_dump;
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(smoke_paged_attention_prefix_kv,
+                         paged_attention_prefix_kv_test,
+                         ::testing::Values(paged_attention_test_params{{{3, 5}},
+                                                                       8,
+                                                                       2,
+                                                                       128,
+                                                                       128,
+                                                                       16,
+                                                                       0,
+                                                                       DISABLE_CACHE_COMPRESSION,
+                                                                       ov::internal::CacheQuantMode::BY_CHANNEL,
+                                                                       DYNAMIC_INPUT_PAD,
+                                                                       DISABLE_SCORES,
+                                                                       DISABLE_ROTATION,
+                                                                       DISABLE_FA_V2,
+                                                                       false,
+                                                                       0,
+                                                                       {},
+                                                                       false,
+                                                                       {}},
+                                           paged_attention_test_params{{{2, 5}, {3, 7}},
+                                                                       8,
+                                                                       2,
+                                                                       128,
+                                                                       128,
+                                                                       16,
+                                                                       0,
+                                                                       DISABLE_CACHE_COMPRESSION,
+                                                                       ov::internal::CacheQuantMode::BY_CHANNEL,
+                                                                       DYNAMIC_INPUT_PAD,
+                                                                       DISABLE_SCORES,
+                                                                       DISABLE_ROTATION,
+                                                                       DISABLE_FA_V2,
+                                                                       false,
+                                                                       0,
+                                                                       {},
+                                                                       false,
+                                                                       {}},
+                                           paged_attention_test_params{{{0, 5}},
+                                                                       8,
+                                                                       2,
+                                                                       128,
+                                                                       128,
+                                                                       16,
+                                                                       0,
+                                                                       DISABLE_CACHE_COMPRESSION,
+                                                                       ov::internal::CacheQuantMode::BY_TOKEN,
+                                                                       DYNAMIC_INPUT_PAD,
+                                                                       DISABLE_SCORES,
+                                                                       DISABLE_ROTATION,
+                                                                       DISABLE_FA_V2,
+                                                                       false,
+                                                                       0,
+                                                                       {},
+                                                                       false,
+                                                                       {}},
+                                           paged_attention_test_params{{{2, 17}},
+                                                                       8,
+                                                                       2,
+                                                                       128,
+                                                                       128,
+                                                                       16,
+                                                                       0,
+                                                                       DISABLE_CACHE_COMPRESSION,
+                                                                       ov::internal::CacheQuantMode::BY_TOKEN,
+                                                                       DYNAMIC_INPUT_PAD,
+                                                                       DISABLE_SCORES,
+                                                                       DISABLE_ROTATION,
+                                                                       DISABLE_FA_V2,
+                                                                       false,
+                                                                       0,
+                                                                       {},
+                                                                       false,
+                                                                       {}},
+                                           paged_attention_test_params{{{1, 5}},
+                                                                       8,
+                                                                       2,
+                                                                       128,
+                                                                       128,
+                                                                       16,
+                                                                       0,
+                                                                       DISABLE_CACHE_COMPRESSION,
+                                                                       ov::internal::CacheQuantMode::BY_CHANNEL,
+                                                                       DYNAMIC_INPUT_PAD,
+                                                                       DISABLE_SCORES,
+                                                                       DISABLE_ROTATION,
+                                                                       DISABLE_FA_V2,
+                                                                       false,
+                                                                       0,
+                                                                       {},
+                                                                       false,
+                                                                       {}},
+                                           paged_attention_test_params{{{0, 1}},
+                                                                       8,
+                                                                       2,
+                                                                       128,
+                                                                       128,
+                                                                       16,
+                                                                       0,
+                                                                       DISABLE_CACHE_COMPRESSION,
+                                                                       ov::internal::CacheQuantMode::BY_TOKEN,
+                                                                       DYNAMIC_INPUT_PAD,
+                                                                       DISABLE_SCORES,
+                                                                       DISABLE_ROTATION,
+                                                                       DISABLE_FA_V2,
+                                                                       false,
+                                                                       0,
+                                                                       {},
+                                                                       false,
+                                                                       {}}));
+
 #ifdef ENABLE_ONEDNN_FOR_GPU
 class paged_attention_u4_mixed_micro_test : public PagedAttentionTest<paged_attention_test_params> {};
 

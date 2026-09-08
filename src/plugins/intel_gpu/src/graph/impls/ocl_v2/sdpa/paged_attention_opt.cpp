@@ -221,8 +221,17 @@ size_t get_partitioning_size(const kernel_impl_params& params, size_t head_size,
 PagedAttentionStage get_paged_attention_stage(const kernel_impl_params& impl_param) {
     const auto& query_shape = impl_param.get_input_layout(PagedAttentionInputIdx::QUERY).get_partial_shape();
     const auto& past_lens_shape = impl_param.get_input_layout(PagedAttentionInputIdx::PAST_LENS).get_partial_shape();
+    const auto desc = impl_param.typed_desc<paged_attention>();
 
     if (query_shape.is_static() && past_lens_shape.is_static()) {
+        if (desc->has_prefix_kv) {
+            const auto& memory_deps = impl_param.memory_deps;
+            const auto subsequence_begins_mem = memory_deps.at(PagedAttentionInputIdx::SUBSEQUENCE_BEGINS);
+            mem_lock<int32_t, mem_lock_type::read> subsequence_begins_lock(subsequence_begins_mem, *impl_param.strm);
+            if (subsequence_begins_lock.size() > 0 && subsequence_begins_lock[subsequence_begins_lock.size() - 1] == 0) {
+                return PagedAttentionStage::CACHE_UPDATE_ONLY;
+            }
+        }
         if (query_shape[0].get_length() == past_lens_shape[0].get_length()) {
             return PagedAttentionStage::GENERATE;
         }
@@ -939,21 +948,32 @@ protected:
 
 class KVCacheUpdateGenerator : public KernelGenerator {
 public:
-    KVCacheUpdateGenerator() : KernelGenerator("pa_kv_cache_update_ref") {}
+    explicit KVCacheUpdateGenerator(bool is_prefix_update = false) : KernelGenerator("pa_kv_cache_update_ref"), m_is_prefix_update(is_prefix_update) {}
 
 protected:
+    size_t get_key_input_idx() const {
+        return m_is_prefix_update ? PagedAttentionInputIdx::PREFIX_KEY : PagedAttentionInputIdx::KEY;
+    }
+
+    size_t get_value_input_idx() const {
+        return m_is_prefix_update ? PagedAttentionInputIdx::PREFIX_VALUE : PagedAttentionInputIdx::VALUE;
+    }
+
+    size_t get_subsequence_begins_input_idx() const {
+        return m_is_prefix_update ? PagedAttentionInputIdx::PREFIX_SUBSEQUENCE_BEGINS : PagedAttentionInputIdx::SUBSEQUENCE_BEGINS;
+    }
+
     [[nodiscard]] JitConstants get_jit_constants(const kernel_impl_params& params) const override {
         auto jit = make_base_jit_constants(params);
 
         const auto& in_offsets_map = params.in_port_to_shape_info_offset;
 
-        // constexpr static std::array input_ids = {1, 2, 5, 7, 8, 6};
-        constexpr static std::array input_ids = {PagedAttentionInputIdx::KEY,
-                                                 PagedAttentionInputIdx::VALUE,
+        const std::array<size_t, 6> input_ids = {get_key_input_idx(),
+                                                 get_value_input_idx(),
                                                  PagedAttentionInputIdx::PAST_LENS,
                                                  PagedAttentionInputIdx::BLOCK_INDICES,
                                                  PagedAttentionInputIdx::BLOCK_INDICES_BEGINS,
-                                                 PagedAttentionInputIdx::SUBSEQUENCE_BEGINS};
+                                                 get_subsequence_begins_input_idx()};
 
         for (size_t i = 0; i < input_ids.size(); i++) {
             const size_t tensor_id = input_ids.at(i);
@@ -989,8 +1009,8 @@ protected:
         const bool is_kv_compressed = get_kv_compressed(params);
         jit.make("IS_KV_COMPRESSED", is_kv_compressed ? 1 : 0);
         if (is_kv_compressed) {
-            auto data_type = params.input_layouts[PagedAttentionInputIdx::KEY].data_type;  // key tensor data size
-            auto scales_zp_size = get_element_size(data_type) * 2;                         // scale + zp
+            auto data_type = params.input_layouts[get_key_input_idx()].data_type;  // key tensor data size
+            auto scales_zp_size = get_element_size(data_type) * 2;                 // scale + zp
             if (data_type_traits::is_i4_u4(kv_cache_dt)) {
                 jit.make("SCALE_ZP_SIZE_PER_TOKEN", scales_zp_size);
                 jit.add(make_uint4_kv_cache_jit_constants(params));
@@ -1035,12 +1055,12 @@ protected:
         }
 
         // Inputs
-        args.push_back({ArgumentDescriptor::Types::INPUT, PagedAttentionInputIdx::KEY});                   // key
-        args.push_back({ArgumentDescriptor::Types::INPUT, PagedAttentionInputIdx::VALUE});                 // value
-        args.push_back({ArgumentDescriptor::Types::INPUT, PagedAttentionInputIdx::PAST_LENS});             // past_lens
-        args.push_back({ArgumentDescriptor::Types::INPUT, PagedAttentionInputIdx::BLOCK_INDICES});         // block_indices
-        args.push_back({ArgumentDescriptor::Types::INPUT, PagedAttentionInputIdx::BLOCK_INDICES_BEGINS});  // block_indices_begins
-        args.push_back({ArgumentDescriptor::Types::INPUT, PagedAttentionInputIdx::SUBSEQUENCE_BEGINS});    // subsequence_begins
+        args.push_back({ArgumentDescriptor::Types::INPUT, static_cast<uint32_t>(get_key_input_idx())});                 // key
+        args.push_back({ArgumentDescriptor::Types::INPUT, static_cast<uint32_t>(get_value_input_idx())});               // value
+        args.push_back({ArgumentDescriptor::Types::INPUT, PagedAttentionInputIdx::PAST_LENS});                          // past_lens
+        args.push_back({ArgumentDescriptor::Types::INPUT, PagedAttentionInputIdx::BLOCK_INDICES});                      // block_indices
+        args.push_back({ArgumentDescriptor::Types::INPUT, PagedAttentionInputIdx::BLOCK_INDICES_BEGINS});               // block_indices_begins
+        args.push_back({ArgumentDescriptor::Types::INPUT, static_cast<uint32_t>(get_subsequence_begins_input_idx())});  // subsequence_begins
 
         // Outputs
         args.push_back({ArgumentDescriptor::Types::INPUT, PagedAttentionInputIdx::KEY_CACHE});    // key_cache
@@ -1050,21 +1070,24 @@ protected:
         args.push_back({ArgumentDescriptor::Types::INTERNAL_BUFFER, 1});
         args.push_back({ArgumentDescriptor::Types::INTERNAL_BUFFER, 2});
         args.push_back({ArgumentDescriptor::Types::SCALAR, 0});
+        args.push_back({ArgumentDescriptor::Types::SCALAR, 1});
 
         return args;
     }
 
     [[nodiscard]] DispatchDataFunc get_dispatch_data_func() const override {
-        return DispatchDataFunc{[](const RuntimeParams& params, KernelData& kd, ImplRuntimeParams* rt_params) {
+        const auto key_input_idx = get_key_input_idx();
+        const bool is_prefix_update = m_is_prefix_update;
+        return DispatchDataFunc{[key_input_idx, is_prefix_update](const RuntimeParams& params, KernelData& kd, ImplRuntimeParams* rt_params) {
             assert(!params.is_dynamic());
             auto& wgs = kd.params.workGroups;
             auto& scalars = kd.params.scalars;
-            scalars.resize(1);
+            scalars.resize(2);
 
             const auto desc = params.typed_desc<paged_attention>();
             auto* rtp = static_cast<PagedAttentionRuntimeParams*>(rt_params);
 
-            const auto is_prefill = rtp->stage == PagedAttentionStage::PREFILL || rtp->stage == PagedAttentionStage::MIXED;
+            const auto is_prefill = !is_prefix_update && (rtp->stage == PagedAttentionStage::PREFILL || rtp->stage == PagedAttentionStage::MIXED);
             auto heads_number = desc->kv_heads_num;
 
             if (is_prefill) {
@@ -1073,17 +1096,23 @@ protected:
                 wgs.global = {blocks_number, heads_number, subgroup_size};
                 wgs.local = {1, 1, subgroup_size};
             } else {
-                const auto& key_input = params.input_layouts[0];
-                const auto sequences_number = key_input.get_partial_shape()[0].get_length();
-                size_t head_size_partition = get_num_k_head_size_partitions(desc->is_key_by_channel, desc->k_head_size);
-                wgs.global = {static_cast<size_t>(sequences_number), heads_number, subgroup_size * head_size_partition};
+                const auto& key_input = params.input_layouts[key_input_idx];
+                const auto tokens_number = key_input.get_partial_shape()[0].get_length();
+                const bool split_key_head = get_kv_compressed(params) && desc->is_key_by_channel;
+                size_t head_size_partition = is_prefix_update ? 1 : get_num_k_head_size_partitions(split_key_head, desc->k_head_size);
+                wgs.global = {static_cast<size_t>(tokens_number), heads_number, subgroup_size * head_size_partition};
                 wgs.local = {1, 1, subgroup_size};
             }
 
             scalars[0].t = ScalarDescriptor::Types::UINT32;
             scalars[0].v.u32 = static_cast<uint32_t>(is_prefill);
+            scalars[1].t = ScalarDescriptor::Types::UINT32;
+            scalars[1].v.u32 = static_cast<uint32_t>(is_prefix_update);
         }};
     }
+
+private:
+    bool m_is_prefix_update = false;
 };
 
 class KVCacheRotateGenerator : public KernelGenerator {
@@ -1323,6 +1352,7 @@ public:
     DECLARE_OBJECT_TYPE_SERIALIZATION(ov::intel_gpu::ocl::PagedAttentionOptImpl)
 
     Stage::Ptr kv_cache_update = make_stage<KVCacheUpdateGenerator>();
+    Stage::Ptr prefix_kv_cache_update = make_stage<KVCacheUpdateGenerator>(true);
     Stage::Ptr pa_single_token = make_stage<PagedAttentionGeneratorSingleToken>();
     Stage::Ptr pa_gqa_single_token = make_stage<PagedAttentionGeneratorGQASingleToken>();
     Stage::Ptr pa_single_token_finalization = make_stage<PagedAttentionGeneratorSingleTokenFinalization>();
@@ -1351,6 +1381,19 @@ public:
             add_stage(pa_sdpa_micro_mixed, params);
         }
 #endif
+
+        if (desc->has_prefix_kv) {
+            OPENVINO_ASSERT(!get_kv_compressed(params), "[GPU] PagedAttention prefix K/V update initially supports only uncompressed KV cache.");
+            OPENVINO_ASSERT(params.get_input_layout(PagedAttentionInputIdx::PREFIX_KEY).data_type == ov::element::f16 &&
+                                params.get_input_layout(PagedAttentionInputIdx::PREFIX_VALUE).data_type == ov::element::f16 &&
+                                params.get_input_layout(PagedAttentionInputIdx::KEY_CACHE).data_type == ov::element::f16 &&
+                                params.get_input_layout(PagedAttentionInputIdx::VALUE_CACHE).data_type == ov::element::f16,
+                            "[GPU] PagedAttention prefix K/V update initially supports only FP16 prefix and cache tensors.");
+            OPENVINO_ASSERT(!has_scores_output && !has_rotated_blocks && !has_adaptive_rkv && !desc->has_xattention,
+                            "[GPU] PagedAttention prefix K/V update does not support scores, rotation, Adaptive RKV, "
+                            "or XAttention.");
+            add_stage(prefix_kv_cache_update, params);
+        }
 
         add_stage(kv_cache_update, params);
         add_stage(pa_multi_token, params);
@@ -1480,6 +1523,16 @@ public:
         rt_params->max_context_len = get_max_context_len(params);
         rt_params->stage = stage;
         rt_params->partition_size = get_partitioning_size(params, desc->v_head_size, rt_params->stage);
+        if (stage == PagedAttentionStage::CACHE_UPDATE_ONLY) {
+            rt_params->num_of_partitions = 1;
+            rt_params->paged_attention_aligned_seq_len = 0;
+            rt_params->sdpa_opt_seq_len_partition_size = get_seq_len_partition_size(params.get_device_info(), desc->v_head_size, SDPAStage::MULTI_TOKENS);
+            rt_params->paged_attention_snap_kv_tokens = 0;
+            rt_params->use_micro_sdpa = false;
+            rt_params->use_gqa_kernel = false;
+            rt_params->query_block_size = 16;
+            return;
+        }
 
         auto effective_context_len = rt_params->max_context_len;
         // scores_output is only used in SnapKV path, and it doesn't yet handle the SWA block skip offset
@@ -1549,6 +1602,39 @@ public:
         assert(rt_params != nullptr);
         prepare_internal_buffers(static_cast<paged_attention_inst&>(instance), rt_params->stage, rt_params->use_micro_sdpa, rt_params->query_block_size);
         std::vector<event::ptr> res_event = events;
+        if (desc->has_prefix_kv) {
+            const auto& prefix_key_layout = params.get_input_layout(PagedAttentionInputIdx::PREFIX_KEY);
+            const auto& prefix_value_layout = params.get_input_layout(PagedAttentionInputIdx::PREFIX_VALUE);
+            const auto& prefix_key_shape = prefix_key_layout.get_partial_shape();
+            const auto& prefix_value_shape = prefix_value_layout.get_partial_shape();
+            const auto& key_shape = params.get_input_layout(PagedAttentionInputIdx::KEY).get_partial_shape();
+            const auto& value_shape = params.get_input_layout(PagedAttentionInputIdx::VALUE).get_partial_shape();
+            OPENVINO_ASSERT(prefix_key_shape.is_static() && prefix_value_shape.is_static() && key_shape.is_static() && value_shape.is_static(),
+                            "[GPU] PagedAttention prefix K/V execution requires static runtime layouts.");
+            OPENVINO_ASSERT(prefix_key_shape[0] == prefix_value_shape[0], "[GPU] PagedAttention prefix key/value token counts must match.");
+            OPENVINO_ASSERT(prefix_key_shape[1] == key_shape[1], "[GPU] PagedAttention prefix key feature width must match key.");
+            OPENVINO_ASSERT(prefix_value_shape[1] == value_shape[1], "[GPU] PagedAttention prefix value feature width must match value.");
+            if (prefix_key_layout.count() > 0) {
+                auto& stream = instance.get_network().get_stream();
+                mem_lock<int32_t, mem_lock_type::read> past_lens_lock(static_cast<paged_attention_inst&>(instance).past_lens_memory_ptr(), stream);
+                mem_lock<int32_t, mem_lock_type::read> prefix_begins_lock(static_cast<paged_attention_inst&>(instance).prefix_subsequence_begins_memory_ptr(),
+                                                                          stream);
+                OPENVINO_ASSERT(prefix_begins_lock.size() == past_lens_lock.size() + 1,
+                                "[GPU] PagedAttention prefix_subsequence_begins must have B_seq + 1 elements.");
+                OPENVINO_ASSERT(prefix_begins_lock[0] == 0, "[GPU] PagedAttention prefix_subsequence_begins must start with 0.");
+                const auto prefix_tokens = prefix_key_layout.get_partial_shape()[0].get_length();
+                OPENVINO_ASSERT(prefix_begins_lock[prefix_begins_lock.size() - 1] == prefix_tokens,
+                                "[GPU] PagedAttention prefix_subsequence_begins must end at the prefix token count.");
+                for (size_t seq_idx = 0; seq_idx < past_lens_lock.size(); ++seq_idx) {
+                    const auto prefix_begin = prefix_begins_lock[seq_idx];
+                    const auto prefix_end = prefix_begins_lock[seq_idx + 1];
+                    OPENVINO_ASSERT(prefix_begin <= prefix_end, "[GPU] PagedAttention prefix_subsequence_begins must be nondecreasing.");
+                    const auto prefix_len = prefix_end - prefix_begin;
+                    OPENVINO_ASSERT(past_lens_lock[seq_idx] >= prefix_len, "[GPU] PagedAttention past_lens must include the current prefix K/V length.");
+                }
+                res_event = {execute_stage(res_event, instance, prefix_kv_cache_update)};
+            }
+        }
         if (desc->write_kv_cache) {
             if (has_rotated_blocks) {
                 const auto& rotated_block_indices_input = params.get_input_layout(PagedAttentionInputIdx::ROTATED_BLOCK_INDICES);
@@ -1556,7 +1642,15 @@ public:
                     res_event = {execute_stage(res_event, instance, kv_cache_rotate)};
                 }
             }
-            res_event = {execute_stage(res_event, instance, kv_cache_update)};
+            const auto& key_layout = params.get_input_layout(PagedAttentionInputIdx::KEY);
+            if (rt_params->stage != PagedAttentionStage::CACHE_UPDATE_ONLY && key_layout.count() > 0) {
+                res_event = {execute_stage(res_event, instance, kv_cache_update)};
+            }
+        }
+
+        if (rt_params->stage == PagedAttentionStage::CACHE_UPDATE_ONLY) {
+            OPENVINO_ASSERT(!res_event.empty(), "[GPU] PagedAttention cache-update-only call has no prefix K/V work.");
+            return res_event[0];
         }
 
         if (rt_params->stage == PagedAttentionStage::PREFILL) {
@@ -1601,11 +1695,12 @@ public:
 
     bool requires_update(primitive_inst& inst, const kernel_impl_params& impl_params) const override {
         const auto stage = get_paged_attention_stage(impl_params);
+        const auto desc = impl_params.typed_desc<paged_attention>();
 
         // In case of MIXED mode execution Paged Attention may require dispatch data update and internal
         // buffers reallocation even if the input shapes haven't been changed. Therefore, check the current execution
         // mode and update parameters if needed
-        return stage == PagedAttentionStage::MIXED;
+        return desc->has_prefix_kv || stage == PagedAttentionStage::MIXED;
     }
 
     [[nodiscard]] std::vector<BufferDescriptor> get_internal_buffer_descs(const kernel_impl_params& params) const override {
@@ -1708,6 +1803,10 @@ public:
         internal_buffers.emplace_back(indexes_buf_size, indexes_dt, lockable, not_shareable);  // 0
         internal_buffers.emplace_back(indexes_buf_size, indexes_dt, lockable, not_shareable);  // 1
         internal_buffers.emplace_back(indexes_buf_size, indexes_dt, lockable, not_shareable);  // 2
+
+        if (stage == PagedAttentionStage::CACHE_UPDATE_ONLY) {
+            return internal_buffers;
+        }
 
         const auto& input = params.input_layouts[0];
         const int64_t total_tokens = input.get_partial_shape()[0].get_length();
@@ -1845,7 +1944,8 @@ public:
             return sequential_gws_subseq_mapping_idx;
         };
 
-        if ((stage == PagedAttentionStage::UNKNOWN) || (stage == PagedAttentionStage::GENERATE && !has_scores_output && !use_micro_sdpa))
+        if (stage == PagedAttentionStage::UNKNOWN || stage == PagedAttentionStage::CACHE_UPDATE_ONLY ||
+            (stage == PagedAttentionStage::GENERATE && !has_scores_output && !use_micro_sdpa))
             return;
 
         auto& stream = instance.get_network().get_stream();

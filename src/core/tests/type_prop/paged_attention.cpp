@@ -72,6 +72,15 @@ ov::OutputVector make_valid_pa_args(const element::Type& t = element::f32) {
             xbs,           xst,   sinks, arkv_start, arkv_evict,  arkv_idx,  arkv_beg, token_type_ids, qq_bias,
             qq_bias_begins};
 }
+
+ov::OutputVector append_valid_prefix_args(ov::OutputVector args, const element::Type& t = element::f32) {
+    using ov::op::v0::Parameter;
+
+    args.push_back(std::make_shared<Parameter>(t, PartialShape{5, 4}));
+    args.push_back(std::make_shared<Parameter>(t, PartialShape{5, 4}));
+    args.push_back(std::make_shared<Parameter>(element::i32, PartialShape{4}));
+    return args;
+}
 }  // namespace
 TEST(type_prop, paged_attention_static_eviction_per_block) {
     const auto query = std::make_shared<op::v0::Parameter>(element::f32, PartialShape{3, 4});
@@ -315,7 +324,79 @@ TEST(type_prop, paged_attention_invalid_input_count) {
     args.pop_back();  // 27 instead of 28
     OV_EXPECT_THROW(std::ignore = std::make_shared<op::PagedAttentionExtension>(args),
                     ov::NodeValidationFailure,
-                    HasSubstr("28 inputs"));
+                    HasSubstr("28 legacy inputs or 31 inputs"));
+}
+
+TEST(type_prop, paged_attention_prefix_kv) {
+    const auto args = append_valid_prefix_args(make_valid_pa_args());
+    const auto op = std::make_shared<op::PagedAttentionExtension>(args);
+    EXPECT_EQ(op->get_input_size(), 31);
+    EXPECT_EQ(op->get_output_element_type(0), element::f32);
+    EXPECT_EQ(op->get_output_partial_shape(0), (PartialShape{3, 4}));
+}
+
+TEST(type_prop, paged_attention_prefix_kv_empty) {
+    auto args = make_valid_pa_args();
+    args.push_back(std::make_shared<op::v0::Parameter>(element::f32, PartialShape{0, 4}));
+    args.push_back(std::make_shared<op::v0::Parameter>(element::f32, PartialShape{0, 4}));
+    args.push_back(std::make_shared<op::v0::Parameter>(element::i32, PartialShape{0}));
+    EXPECT_NO_THROW(std::ignore = std::make_shared<op::PagedAttentionExtension>(args));
+}
+
+TEST(type_prop, paged_attention_prefix_kv_invalid_token_dimensions) {
+    auto args = append_valid_prefix_args(make_valid_pa_args());
+    args[29] = std::make_shared<op::v0::Parameter>(element::f32, PartialShape{6, 4});
+    OV_EXPECT_THROW(std::ignore = std::make_shared<op::PagedAttentionExtension>(args),
+                    ov::NodeValidationFailure,
+                    HasSubstr("Prefix key and value token dimensions"));
+}
+
+TEST(type_prop, paged_attention_prefix_key_invalid_feature_dimension) {
+    auto args = append_valid_prefix_args(make_valid_pa_args());
+    args[28] = std::make_shared<op::v0::Parameter>(element::f32, PartialShape{5, 8});
+    OV_EXPECT_THROW(std::ignore = std::make_shared<op::PagedAttentionExtension>(args),
+                    ov::NodeValidationFailure,
+                    HasSubstr("Prefix key feature dimension"));
+}
+
+TEST(type_prop, paged_attention_prefix_value_invalid_feature_dimension) {
+    auto args = append_valid_prefix_args(make_valid_pa_args());
+    args[29] = std::make_shared<op::v0::Parameter>(element::f32, PartialShape{5, 8});
+    OV_EXPECT_THROW(std::ignore = std::make_shared<op::PagedAttentionExtension>(args),
+                    ov::NodeValidationFailure,
+                    HasSubstr("Prefix value feature dimension"));
+}
+
+TEST(type_prop, paged_attention_prefix_begins_invalid_type) {
+    auto args = append_valid_prefix_args(make_valid_pa_args());
+    args[30] = std::make_shared<op::v0::Parameter>(element::i64, PartialShape{4});
+    OV_EXPECT_THROW(std::ignore = std::make_shared<op::PagedAttentionExtension>(args),
+                    ov::NodeValidationFailure,
+                    HasSubstr("Element type of `prefix_subsequence_begins`"));
+}
+
+TEST(type_prop, paged_attention_prefix_key_invalid_type) {
+    auto args = append_valid_prefix_args(make_valid_pa_args());
+    args[28] = std::make_shared<op::v0::Parameter>(element::f16, PartialShape{5, 4});
+    OV_EXPECT_THROW(std::ignore = std::make_shared<op::PagedAttentionExtension>(args),
+                    ov::NodeValidationFailure,
+                    HasSubstr("Prefix key element type"));
+}
+
+TEST(type_prop, paged_attention_invalid_prefix_input_count) {
+    auto args = append_valid_prefix_args(make_valid_pa_args());
+    args.pop_back();  // 30 instead of 31
+    OV_EXPECT_THROW(std::ignore = std::make_shared<op::PagedAttentionExtension>(args),
+                    ov::NodeValidationFailure,
+                    HasSubstr("28 legacy inputs or 31 inputs"));
+}
+
+TEST(type_prop, paged_attention_invalid_single_prefix_input_count) {
+    auto args = make_valid_pa_args();
+    args.push_back(std::make_shared<op::v0::Parameter>(element::f32, PartialShape{5, 4}));  // 29 instead of 31
+    OV_EXPECT_THROW(std::ignore = std::make_shared<op::PagedAttentionExtension>(args),
+                    ov::NodeValidationFailure,
+                    HasSubstr("28 legacy inputs or 31 inputs"));
 }
 
 TEST(type_prop, paged_attention_invalid_past_lens_rank) {

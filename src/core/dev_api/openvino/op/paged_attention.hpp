@@ -23,7 +23,8 @@ public:
 
     /// \brief Constructs a PagedAttentionExtension.
     ///
-    /// \param args 28 inputs (see spec for layout):
+    /// \param args 28 legacy inputs or 31 inputs with an optional committed-prefix K/V update
+    ///              (see spec for layout):
     ///   (B_token = total tokens in the call, B_seq = number of sequences,
     ///    H = query heads, Hk = key/value heads, S = head size)
     ///
@@ -33,6 +34,7 @@ public:
     ///  3  key_cache                                        [num_blocks, Hk, Bs, S]   required
     ///  4  value_cache                                      [num_blocks, Hk, Bs, S]   required
     ///  5  past_lens                                        [B_seq], i32              required
+    ///      With prefix K/V, includes the prefix rows visible to query: C + D.
     ///  6  subsequence_begins                               [B_seq + 1], i32          required
     ///  7  block_indices                                    [total_blocks], i32        required
     ///  8  block_indices_begins                             [B_seq + 1], i32          required
@@ -55,6 +57,9 @@ public:
     /// 25  token_type_ids                                   [B_token] or [B_token, 1], i32  optional
     /// 26  qq_bias                                          [total_bias_bytes], u8    optional
     /// 27  qq_bias_begins                                   [B_seq + 1], i32          optional
+    /// 28  prefix_key                                       [B_prefix, Hk * S]        optional
+    /// 29  prefix_value                                     [B_prefix, Hk * Sv]       optional
+    /// 30  prefix_subsequence_begins                        [B_seq + 1], i32          optional
     explicit PagedAttentionExtension(const ov::OutputVector& args, bool write_kv_cache = true);
 
     void validate_and_infer_types() override;

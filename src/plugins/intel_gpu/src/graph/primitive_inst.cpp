@@ -2173,7 +2173,10 @@ void primitive_inst::prepare_primitive() {
         do_runtime_in_place_concat();
         update_shape();
 
-        if (_impl_params->output_layouts[0].count() == 0) {
+        const bool prefix_cache_update = _node->is_type<paged_attention>() && _node->as<paged_attention>().get_primitive()->has_prefix_kv &&
+                                         _impl_params->input_layouts.size() > paged_attention::PagedAttentionInputIdx::PREFIX_KEY &&
+                                         _impl_params->input_layouts[paged_attention::PagedAttentionInputIdx::PREFIX_KEY].count() > 0;
+        if (_impl_params->output_layouts[0].count() == 0 && !prefix_cache_update) {
             GPU_DEBUG_TRACE_DETAIL << id() << " : Skipping because output data is empty " << std::endl;
             set_flag(ExecutionFlags::SKIP);
         }

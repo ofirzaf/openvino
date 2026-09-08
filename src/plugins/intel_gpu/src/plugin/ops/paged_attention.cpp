@@ -20,7 +20,7 @@ using PagedAttentionExtension = ov::op::PagedAttentionExtension;
 namespace ov::intel_gpu {
 
 static void CreatePagedAttentionExtensionOp(ProgramBuilder& p, const std::shared_ptr<ov::op::PagedAttentionExtension>& op) {
-    validate_inputs_count(op, {28});
+    validate_inputs_count(op, {28, 31});
     auto inputs = p.GetInputInfo(op);
     auto prim = cldnn::paged_attention(layer_type_name_ID(op), inputs);
 
@@ -124,6 +124,12 @@ static void CreatePagedAttentionExtensionOp(ProgramBuilder& p, const std::shared
     auto qq_bias_input = ov::as_type_ptr<ov::op::v0::Parameter>(op->get_input_node_shared_ptr(qq_bias_idx));
     if (qq_bias_input && qq_bias_input->get_output_partial_shape(0).is_dynamic()) {
         prim.has_qq_bias = true;
+    }
+    if (op->get_input_size() == 31) {
+        const size_t prefix_key_idx = cldnn::paged_attention::PagedAttentionInputIdx::PREFIX_KEY;
+        const auto& prefix_key_ps = op->get_input_partial_shape(prefix_key_idx);
+        prim.has_prefix_kv = prefix_key_ps.is_dynamic() || (prefix_key_ps.is_static() && ov::shape_size(prefix_key_ps.to_shape()) > 0);
+        OPENVINO_ASSERT(!prim.has_prefix_kv || op->get_write_kv_cache(), "[GPU] PagedAttention prefix K/V update requires write_kv_cache=true.");
     }
     prim.is_key_by_channel = p.get_config().get_key_cache_quant_mode() == ov::internal::CacheQuantMode::BY_CHANNEL;
     prim.write_kv_cache = op->get_write_kv_cache();
