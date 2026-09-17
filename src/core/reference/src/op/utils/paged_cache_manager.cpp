@@ -492,21 +492,27 @@ void PagedCacheManager::begin_step(std::uintptr_t node_key, const std::int32_t* 
         const std::int32_t new_len = past_lens ? past_lens[s] : 0;
         auto& seq = st.sequences[s];
 
-        // If the external timeline was reset/truncated, reset this sequence state
+        // A shorter timeline rolls back a speculative tail. Keep the retained
+        // prefix, including its partial last block; past=0 still resets all state.
         if (new_len < seq.logical_length) {
-            for (const std::int32_t bid : seq.blocks) {
+            const auto retained_tokens = std::max<int32_t>(0, new_len - seq.trim_front);
+            const auto retained_blocks = std::min(seq.blocks.size(),
+                                                  (retained_tokens + st.block_size - 1) / st.block_size);
+            while (seq.blocks.size() > retained_blocks) {
+                const auto bid = seq.blocks.back();
+                seq.blocks.pop_back();
                 if (bid >= 0 && static_cast<std::size_t>(bid) < st.num_blocks && st.block_used[bid]) {
                     st.block_used[bid] = 0;
                     st.free_blocks.push_back(bid);
                 }
             }
-            seq.blocks.clear();
             seq.block_scores.clear();
             seq.diversity_matrix.clear();
             seq.diversity_n_blocks = 0;
             seq.diversity_evict_size = 0;
             seq.diversity_start_block = 0;
-            seq.trim_front = 0;
+            if (retained_blocks == 0)
+                seq.trim_front = 0;
             seq.logical_length = new_len;
             continue;
         }

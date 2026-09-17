@@ -170,6 +170,9 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
         global half *A,
 #if IS_PAGED_ATTENTION
         const __global INPUT3_TYPE* subsequence_begins,
+    #if HAS_QUERY_SUBSEQUENCE_BEGINS
+        const __global INPUT3_TYPE* query_subsequence_begins,
+    #endif
     #if !IS_PREFILL
         const __global INPUT3_TYPE* past_lens,
         const __global INPUT3_TYPE* block_indices,
@@ -208,8 +211,15 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
     const uint query_block_idx = get_group_id(0) << 1;
     const uint block_start_pos = blocked_indexes_start_and_gws_mapping[query_block_idx];
     const uint gws_mapping = blocked_indexes_start_and_gws_mapping[query_block_idx + 1];
-    const uint subsequence_begin = subsequence_begins[gws_mapping];
-    const uint subsequence_end = subsequence_begins[gws_mapping + 1];
+    const uint kv_subsequence_begin = subsequence_begins[gws_mapping];
+    const uint kv_subsequence_end = subsequence_begins[gws_mapping + 1];
+#if HAS_QUERY_SUBSEQUENCE_BEGINS
+    const uint subsequence_begin = query_subsequence_begins[gws_mapping];
+    const uint subsequence_end = query_subsequence_begins[gws_mapping + 1];
+#else
+    const uint subsequence_begin = kv_subsequence_begin;
+    const uint subsequence_end = kv_subsequence_end;
+#endif
     const uint subsequence_query_block_idx = block_start_pos - subsequence_begin;
     int q = subsequence_end - subsequence_begin;
     #if HAS_QQ_BIAS
@@ -218,10 +228,13 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
     #endif
 #if IS_PREFILL
     const int past_len = 0;
-    const int k = q;
+    const int k = kv_subsequence_end - kv_subsequence_begin;
 #else
     const int past_len = past_lens[gws_mapping];
-    const int k = q + past_len;
+    const int k = kv_subsequence_end - kv_subsequence_begin + past_len;
+#endif
+#if HAS_TOKEN_TYPE_IDS
+    token_type_ids += kv_subsequence_begin;
 #endif
     const int d = HEAD_SIZE;
 #if IS_GQA_SINGLE_TOKEN
@@ -245,9 +258,9 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
 
     int causal_k = k;
 #if IS_CAUSAL
-    #if IS_PAGED_ATTENTION && !IS_PREFILL
+    #if IS_PAGED_ATTENTION
         #if !IS_GQA_SINGLE_TOKEN
-            causal_k = min(k, past_len + (int)wg_j0 + ugemm_kq_wg_tile_n);
+            causal_k = min(k, k - q + (int)wg_j0 + ugemm_kq_wg_tile_n);
         #endif
     #elif !IS_PAGED_ATTENTION && CAUSAL_MASK_LOWER_RIGHT
         const int causal_offset = max(0, k - q);
@@ -255,18 +268,18 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
     #else
         causal_k = min(k, (int)wg_j0 + ugemm_kq_wg_tile_n);
     #endif
-    #if HAS_TOKEN_TYPE_IDS && IS_PAGED_ATTENTION && IS_PREFILL
+    #if HAS_TOKEN_TYPE_IDS && IS_PAGED_ATTENTION
     /* Extend causal_k to cover the full bidirectional group that overlaps
        the current WG's query range. Without this, future K positions in
        the same image-token group would be skipped entirely.
        Only lane 0 performs the scan; result is broadcast to all WIs. */
     {
-        int wg_q_end = min((int)wg_j0 + ugemm_kq_wg_tile_n, k) - 1;
+        int wg_q_end = min(k - q + (int)wg_j0 + ugemm_kq_wg_tile_n, k) - 1;
         int bidir_causal_k = causal_k;
-        if (wg_q_end >= 0 && wg_q_end < k && token_type_ids[wg_q_end] == 1) {
+        if (wg_q_end >= past_len && wg_q_end < k && token_type_ids[wg_q_end - past_len] == 1) {
             int bidir_end = wg_q_end + 1;
             if (get_sub_group_local_id() == 0) {
-                while (bidir_end < k && token_type_ids[bidir_end] == 1)
+                while (bidir_end < k && token_type_ids[bidir_end - past_len] == 1)
                     bidir_end++;
             }
             bidir_end = sub_group_broadcast(bidir_end, 0);
@@ -282,20 +295,20 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
 #if IS_CAUSAL && SLIDING_WINDOW_SIZE
     #if IS_GQA_SINGLE_TOKEN
         window_k_begin = MAX(0, k - SLIDING_WINDOW_SIZE);
-    #elif IS_PAGED_ATTENTION && !IS_PREFILL
-        window_k_begin = MAX(0, past_len + (int)wg_j0 - SLIDING_WINDOW_SIZE + 1);
+    #elif IS_PAGED_ATTENTION
+        window_k_begin = MAX(0, k - q + (int)wg_j0 - SLIDING_WINDOW_SIZE + 1);
     #else
         window_k_begin = MAX(0, (int)wg_j0 - SLIDING_WINDOW_SIZE + 1);
     #endif
-    #if HAS_TOKEN_TYPE_IDS && IS_PAGED_ATTENTION && IS_PREFILL
+    #if HAS_TOKEN_TYPE_IDS && IS_PAGED_ATTENTION
     /* Extend sliding window start to include the full bidirectional group
        that overlaps the window boundary. Without this, K positions in the
        same image-token group but before window_k_begin would be skipped.
        Only lane 0 performs the scan; result is broadcast to all WIs. */
-    if (window_k_begin > 0 && token_type_ids[window_k_begin] == 1) {
+    if (window_k_begin > past_len && window_k_begin < k && token_type_ids[window_k_begin - past_len] == 1) {
         int wb = window_k_begin;
         if (get_sub_group_local_id() == 0) {
-            while (wb > 0 && token_type_ids[wb - 1] == 1)
+            while (wb > past_len && token_type_ids[wb - past_len - 1] == 1)
                 wb--;
         }
         window_k_begin = sub_group_broadcast(wb, 0);
@@ -412,18 +425,18 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
            + b0 * HEAD_SIZE;
     #endif
     #if IS_PREFILL
-        K += subsequence_begin * ldk
+        K += kv_subsequence_begin * ldk
            + b0_kv * HEAD_SIZE + INPUT1_PAD_BEFORE_FEATURE_NUM;
-        V += subsequence_begin * ldv
+        V += kv_subsequence_begin * ldv
            + b0_kv * HEAD_SIZE + INPUT2_PAD_BEFORE_FEATURE_NUM;
     #else
         const uint base_block_index = block_indices_begins[gws_mapping];
 
         K += b0_kv * ADJUSTED_K_HEAD_SIZE * ADJUSTED_PAGED_ATTENTION_BLOCK_SIZE;
         V += b0_kv * ADJUSTED_V_HEAD_SIZE * PAGED_ATTENTION_BLOCK_SIZE;
-        Kc += subsequence_begin * ldkc
+        Kc += kv_subsequence_begin * ldkc
             + b0_kv * HEAD_SIZE + INPUT1_PAD_BEFORE_FEATURE_NUM;
-        Vc += subsequence_begin * ldvc
+        Vc += kv_subsequence_begin * ldvc
             + b0_kv * HEAD_SIZE + INPUT2_PAD_BEFORE_FEATURE_NUM;
     #endif
 #else
@@ -998,7 +1011,7 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
 
         int col_offset = wg_j0 + sg_j0_kq;
         int causal_q_begin = col_offset;
-    #if IS_PAGED_ATTENTION && !IS_PREFILL
+    #if IS_PAGED_ATTENTION
         #if IS_GQA_SINGLE_TOKEN
             col_offset += k - 1 - get_sub_group_local_id();
             causal_q_begin += k - 1;
@@ -1011,7 +1024,7 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
         causal_q_begin += k - q;
     #endif
 
-    #if HAS_TOKEN_TYPE_IDS && IS_PAGED_ATTENTION && IS_PREFILL
+    #if HAS_TOKEN_TYPE_IDS && IS_PAGED_ATTENTION
         /* Apply causal mask with bidirectional for image tokens */
         {
             const int k_base = k0 + sg_i0_kq;
@@ -1022,9 +1035,9 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
                     const int offset_q = col_offset + i;
                     if (greater_than(offset_k, offset_q)) {
                         bool is_bidirectional = false;
-                        if (offset_k < q && offset_q < q &&
-                            token_type_ids[offset_k] == 1 &&
-                            token_type_ids[offset_q] == 1) {
+                        if (offset_k >= past_len && offset_k < k && offset_q >= past_len && offset_q < k &&
+                            token_type_ids[offset_k - past_len] == 1 &&
+                            token_type_ids[offset_q - past_len] == 1) {
                             /* Verify no 0 exists between q and k (same 1-group).
                                Scan from the smaller to the larger index so this
                                works both for future tokens (k>q) and for past
@@ -1033,7 +1046,7 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
                             const int scan_begin = min(offset_q, offset_k) + 1;
                             const int scan_end = max(offset_q, offset_k);
                             for (int p = scan_begin; p < scan_end; p++) {
-                                if (token_type_ids[p] != 1) {
+                                if (token_type_ids[p - past_len] != 1) {
                                     is_bidirectional = false;
                                     break;
                                 }

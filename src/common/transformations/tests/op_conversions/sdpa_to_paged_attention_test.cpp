@@ -7510,3 +7510,58 @@ entire SDPAToPA transformation
 const std::vector<ov::element::Type> element_types = {element::f16, element::f32};
 
 INSTANTIATE_TEST_SUITE_P(SDPAToPATest_Conversion, SDPAToPATest, testing::ValuesIn(element_types));
+
+TEST(SDPAToPA, ExplicitAsymmetricInputsWithoutModelMetadata) {
+    // The generic conversion must not depend on model names, DFlash metadata,
+    // proposal semantics, or token-type dependencies in the original mask.
+    for (const bool with_token_types : {false, true}) {
+        auto query = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{1, 2, -1, 16});
+        auto key = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{1, 2, -1, 16});
+        auto value = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{1, 2, -1, 16});
+        auto beam = std::make_shared<ov::op::v0::Parameter>(ov::element::i32, ov::PartialShape{-1});
+        ov::ParameterVector parameters{query, key, value, beam};
+        ov::SinkVector sinks;
+        auto append = [&](const std::shared_ptr<ov::Node>& current, const std::string& name) {
+            auto variable = std::make_shared<ov::op::util::Variable>(ov::op::util::VariableInfo{
+                ov::PartialShape{1, 2, -1, 16}, ov::element::f32, name});
+            auto initial = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{1, 2, 0, 16}, {});
+            auto read = std::make_shared<ov::op::v6::ReadValue>(initial, variable);
+            auto past = std::make_shared<ov::op::v8::Gather>(
+                read, beam, ov::op::v0::Constant::create(ov::element::i32, ov::Shape{}, {0}));
+            auto concat = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{past, current}, 2);
+            sinks.push_back(std::make_shared<ov::op::v6::Assign>(concat, variable));
+            return concat;
+        };
+        auto k = append(key, "key_rows");
+        auto v = append(value, "value_rows");
+        auto mask = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{}, {0});
+        auto sdpa = std::make_shared<ov::op::v13::ScaledDotProductAttention>(query, k, v, mask, !with_token_types);
+        auto types = std::make_shared<ov::op::v0::Parameter>(ov::element::i32, ov::PartialShape{-1});
+        types->set_friendly_name("token_type_ids");
+        types->output(0).set_names({"token_type_ids"});
+        if (with_token_types)
+            parameters.push_back(types);
+        auto model = std::make_shared<ov::Model>(ov::OutputVector{sdpa}, sinks, parameters);
+        ov::pass::paged_attention::Options options{};
+        options.use_asymmetric_inputs = true;
+        ov::pass::SDPAToPagedAttention(options).run_on_model(model);
+
+        std::shared_ptr<ov::op::PagedAttentionExtension> pa;
+        for (const auto& node : model->get_ordered_ops()) {
+            EXPECT_FALSE(ov::is_type<ov::op::v13::ScaledDotProductAttention>(node));
+            EXPECT_FALSE(ov::is_type<ov::op::util::ReadValueBase>(node));
+            EXPECT_FALSE(ov::is_type<ov::op::util::AssignBase>(node));
+            if (auto attention = ov::as_type_ptr<ov::op::PagedAttentionExtension>(node))
+                pa = attention;
+        }
+        ASSERT_NE(pa, nullptr);
+        EXPECT_EQ(pa->get_input_size(), 29);
+        EXPECT_EQ(pa->input_value(28).get_node()->get_friendly_name(), "query_subsequence_begins");
+        if (with_token_types)
+            EXPECT_EQ(pa->input_value(25), types->output(0));
+        else
+            EXPECT_EQ(pa->get_input_partial_shape(25), ov::PartialShape{0});
+        EXPECT_EQ(model->get_output_partial_shape(0), (ov::PartialShape{1, 2, -1, 16}));
+        EXPECT_EQ(query->get_partial_shape(), (ov::PartialShape{1, 2, -1, 16}));
+    }
+}

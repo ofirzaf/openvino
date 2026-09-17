@@ -237,6 +237,38 @@
 
 #include "intel_gpu/primitives/scaled_dot_product_attention.hpp"
 namespace {
+
+// Attention masks carry exact zero / excluded-position semantics. Rebalancing
+// their Add branches as activation dequantization can introduce a large bias:
+// FP16 rounding of a reciprocal near 1/65504 turns 0 + (1 - 1)*(-65504)
+// into 31.984375. Keep mask arithmetic out of this scaling rewrite.
+bool feeds_sdpa_mask(const std::shared_ptr<const ov::Node>& root) {
+    std::unordered_set<const ov::Node*> seen;
+    std::vector<const ov::Node*> pending{root.get()};
+    while (!pending.empty()) {
+        const auto* node = pending.back();
+        pending.pop_back();
+        if (!seen.insert(node).second)
+            continue;
+        for (const auto& output : node->outputs()) {
+            for (const auto& input : output.get_target_inputs()) {
+                const auto* consumer = input.get_node();
+                if (ov::is_type<ov::op::v13::ScaledDotProductAttention>(consumer)) {
+                    if (input.get_index() == 3)
+                        return true;
+                    continue;
+                }
+                const std::string type = consumer->get_type_name();
+                if (type == "Add" || type == "Subtract" || type == "Multiply" || type == "Divide" ||
+                    type == "Select" || type == "Broadcast" || type == "Reshape" || type == "Transpose" ||
+                    type == "Unsqueeze" || type == "Squeeze" || type == "Convert" || type == "Slice" ||
+                    type == "StridedSlice")
+                    pending.push_back(consumer);
+            }
+        }
+    }
+    return false;
+}
 template<typename T>
 static bool disable_reduce_decomposition(const std::shared_ptr<const ov::Node> node) {
     if (auto op = std::dynamic_pointer_cast<const T>(node)) {
@@ -1428,6 +1460,7 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         ov::pass::Manager lptManager("GPU:LPT");
 
         auto lptPassConfig = lptManager.get_pass_config();
+        lptPassConfig->set_callback<ov::pass::low_precision::AddTransformation>(feeds_sdpa_mask);
         // Ticket 168016: quantized LSTMSequence / GPUSequence are not supported yet. Avoid extra transformation
         lptPassConfig->disable<ov::pass::low_precision::RecurrentCellTransformation>();
         // Ticket 168015: Low precision PRelu is not supported on GPU
@@ -1649,6 +1682,7 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
             auto perTensorQuantization = std::vector<QuantizationGranularityRestriction>({});
 
             pass_config->disable<ov::pass::AddMultiplyFusion>();
+            pass_config->set_callback<AddTransformation>(feeds_sdpa_mask);
             pass_config->disable<RecurrentCellTransformation>();
             pass_config->disable<MultiplyToGroupConvolutionTransformation>();
             pass_config->disable<ConvolutionTransformation>();

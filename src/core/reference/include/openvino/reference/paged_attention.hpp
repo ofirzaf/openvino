@@ -200,7 +200,9 @@ void paged_attention(std::uintptr_t node_key,
                      const ov::Shape& value_cache_shape,
                      const ov::Shape& past_lens_shape,
                      const ov::Shape& subseq_shape,
-                     std::size_t pool_kernel = 7) {
+                     std::size_t pool_kernel = 7,
+                     const int32_t* query_subsequence_begins = nullptr,
+                     std::size_t query_subsequence_begins_count = 0) {
     OPENVINO_ASSERT(cache_manager != nullptr, "PagedAttention reference: cache_manager is null");
     OPENVINO_ASSERT(query != nullptr && key != nullptr && value != nullptr, "PagedAttention reference: null Q/K/V");
     OPENVINO_ASSERT(out != nullptr, "PagedAttention reference: output is null");
@@ -221,6 +223,12 @@ void paged_attention(std::uintptr_t node_key,
                     "PagedAttention reference: expected past_lens/subsequence_begins rank 1");
 
     const std::size_t batch_tokens = static_cast<std::size_t>(query_shape[0]);
+    const std::size_t kv_tokens = static_cast<std::size_t>(key_shape[0]);
+    OPENVINO_ASSERT(value_shape[0] == kv_tokens, "PagedAttention reference: key/value token counts differ");
+    OPENVINO_ASSERT(query_subsequence_begins != nullptr || batch_tokens == kv_tokens,
+                    "PagedAttention reference: asymmetric Q/KV requires query_subsequence_begins");
+    OPENVINO_ASSERT(query_subsequence_begins == nullptr || !has_xattn,
+                    "PagedAttention reference: asymmetric Q/KV does not support XAttention");
     const std::size_t query_features = static_cast<std::size_t>(query_shape[1]);
     const std::size_t key_features = static_cast<std::size_t>(key_shape[1]);
     const std::size_t value_features = static_cast<std::size_t>(value_shape[1]);
@@ -268,14 +276,38 @@ void paged_attention(std::uintptr_t node_key,
     cache_manager->begin_step(node_key, past_lens, seq_count);
 
     // Parse token-to-sequence partition
-    const auto seq_begins = detail::parse_subsequence_ranges(subsequence_begins, subseq_count, seq_count, batch_tokens);
+    const auto seq_begins = detail::parse_subsequence_ranges(subsequence_begins, subseq_count, seq_count, kv_tokens);
+    auto query_begins = seq_begins;
+    if (query_subsequence_begins != nullptr) {
+        OPENVINO_ASSERT(query_subsequence_begins_count == seq_count + 1 && subseq_count == seq_count + 1,
+                        "PagedAttention reference: expected one boundary per sequence plus an end boundary");
+        OPENVINO_ASSERT(query_subsequence_begins[0] == 0 && subsequence_begins[0] == 0,
+                        "PagedAttention reference: subsequences must start at zero");
+        OPENVINO_ASSERT(query_subsequence_begins[seq_count] >= 0 &&
+                            static_cast<std::size_t>(query_subsequence_begins[seq_count]) == batch_tokens &&
+                            subsequence_begins[seq_count] >= 0 &&
+                            static_cast<std::size_t>(subsequence_begins[seq_count]) == kv_tokens,
+                        "PagedAttention reference: end boundaries must equal tensor token counts");
+        for (std::size_t s = 0; s < seq_count; ++s) {
+            const auto q_len = query_subsequence_begins[s + 1] - query_subsequence_begins[s];
+            const auto kv_len = subsequence_begins[s + 1] - subsequence_begins[s];
+            OPENVINO_ASSERT(q_len >= 0 && kv_len >= q_len,
+                            "PagedAttention reference: each query subsequence must be a suffix of current K/V");
+        }
+        query_begins = detail::parse_subsequence_ranges(query_subsequence_begins,
+                                                       query_subsequence_begins_count,
+                                                       seq_count,
+                                                       batch_tokens);
+    }
 
     // Bidirectional image attention: precompute image group boundaries from token_type_ids.
     // For each image token, record the inclusive begin and exclusive end of its contiguous group.
     const bool has_token_types = (token_type_ids != nullptr && token_type_ids_count > 0);
-    std::vector<int32_t> image_group_begin(batch_tokens, -1);
-    std::vector<int32_t> image_group_end(batch_tokens, -1);
+    std::vector<int32_t> image_group_begin(kv_tokens, -1);
+    std::vector<int32_t> image_group_end(kv_tokens, -1);
     if (has_token_types) {
+        OPENVINO_ASSERT(token_type_ids_count == kv_tokens,
+                        "PagedAttention reference: token types must cover current K/V rows");
         for (std::size_t s = 0; s < seq_count; ++s) {
             auto se = seq_begins[s + 1];
             for (auto i = seq_begins[s]; i < se;) {
@@ -364,7 +396,7 @@ void paged_attention(std::uintptr_t node_key,
         if (t_begin >= t_end) {
             continue;
         }
-        OPENVINO_ASSERT(t_end <= batch_tokens, "PagedAttention reference: subsequence range exceeds batch_tokens");
+        OPENVINO_ASSERT(t_end <= kv_tokens, "PagedAttention reference: subsequence range exceeds K/V token count");
 
         const std::int32_t past = past_lens ? past_lens[s] : 0;
         OPENVINO_ASSERT(past >= 0, "PagedAttention reference: negative past_lens");
@@ -551,8 +583,11 @@ void paged_attention(std::uintptr_t node_key,
                                              value + (t_begin + i) * value_features);
         }
 
-        for (std::size_t i = 0; i < new_len; ++i) {
+        const auto query_len = query_begins[s + 1] - query_begins[s];
+        const auto query_offset = new_len - query_len;
+        for (std::size_t i = query_offset; i < new_len; ++i) {
             const std::size_t token = t_begin + i;
+            const std::size_t query_token = query_begins[s] + i - query_offset;
             const std::int32_t qpos = past + static_cast<std::int32_t>(i);
 
             // Determine attention window
@@ -577,7 +612,7 @@ void paged_attention(std::uintptr_t node_key,
             const std::size_t ctx_len = (end >= start) ? static_cast<std::size_t>(end - start + 1) : 0;
             if (ctx_len == 0) {
                 // No context (shouldn't happen for causal), output zeros
-                std::fill(out + token * out_features, out + (token + 1) * out_features, T(0));
+                std::fill(out + query_token * out_features, out + (query_token + 1) * out_features, T(0));
                 continue;
             }
 
@@ -588,7 +623,7 @@ void paged_attention(std::uintptr_t node_key,
                     ? false
                     : (score_window_i < 0 ? true : (static_cast<std::int32_t>(new_len - i) <= score_window_i));
 
-            const T* qrow = query + token * query_features;
+            const T* qrow = query + query_token * query_features;
 
             for (std::size_t h = 0; h < q_heads; ++h) {
                 const std::size_t kvh = h / group;
@@ -718,7 +753,7 @@ void paged_attention(std::uintptr_t node_key,
                     }
                 }
 
-                T* out_ptr = out + token * out_features + h * v_head_size;
+                T* out_ptr = out + query_token * out_features + h * v_head_size;
                 for (std::size_t d = 0; d < v_head_size; ++d) {
                     out_ptr[d] = static_cast<T>(out_head[d]);
                 }

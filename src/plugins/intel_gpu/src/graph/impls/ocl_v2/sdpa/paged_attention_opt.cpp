@@ -223,7 +223,8 @@ PagedAttentionStage get_paged_attention_stage(const kernel_impl_params& impl_par
     const auto& past_lens_shape = impl_param.get_input_layout(PagedAttentionInputIdx::PAST_LENS).get_partial_shape();
 
     if (query_shape.is_static() && past_lens_shape.is_static()) {
-        if (query_shape[0].get_length() == past_lens_shape[0].get_length()) {
+        if (!impl_param.typed_desc<paged_attention>()->has_query_subsequence_begins &&
+            query_shape[0].get_length() == past_lens_shape[0].get_length()) {
             return PagedAttentionStage::GENERATE;
         }
 
@@ -1383,9 +1384,7 @@ public:
         return false;
     }
 
-    // MIXED may use micro SDPA regardless of token_type_ids: bidirectional masking is implemented
-    // only in the PREFILL kernels, and in MIXED neither micro SDPA nor paged_attention_opt.cl consumes token_type_ids.
-    // TODO: implement bidirectional attention for MIXED with token_type_ids
+    // Micro SDPA handles token-type groups in both PREFILL and MIXED stages.
     bool can_use_micro_sdpa_for(const kernel_impl_params& params, const PagedAttentionStage& stage) const {
         const auto can_use_micro_sdpa = supports_micro_sdpa(params) && valid_micro_stage(stage);
         GPU_DEBUG_TRACE_DETAIL << "can_use_micro_sdpa_for: stage = " << static_cast<size_t>(stage)
@@ -1478,6 +1477,14 @@ public:
         const auto& desc = params.typed_desc<paged_attention>();
 
         auto stage = get_paged_attention_stage(params);
+        OPENVINO_ASSERT(!desc->has_query_subsequence_begins ||
+                            (!desc->has_scores_output() && !desc->has_score_aggregation &&
+                             !desc->has_rotated_blocks && !desc->has_xattention &&
+                             !desc->has_adaptive_rkv && !desc->has_qq_bias &&
+                             params.get_input_layout(PagedAttentionInputIdx::KEY_CACHE).data_type == data_types::f16 &&
+                             params.get_input_layout(PagedAttentionInputIdx::VALUE_CACHE).data_type == data_types::f16),
+                        "[GPU] Asymmetric PagedAttention does not support scores, cache rotation, sparse attention, "
+                        "custom query bias, adaptive eviction, or compressed caches");
         rt_params->max_context_len = get_max_context_len(params);
         rt_params->stage = stage;
         rt_params->partition_size = get_partitioning_size(params, desc->v_head_size, rt_params->stage);
@@ -1518,6 +1525,8 @@ public:
         rt_params->use_micro_sdpa = false;
 #endif
 
+        OPENVINO_ASSERT(!desc->has_query_subsequence_begins || rt_params->use_micro_sdpa,
+                        "[GPU] Asymmetric PagedAttention requires micro SDPA support on this device/configuration");
         rt_params->query_block_size = get_query_block_size(rt_params->stage, rt_params->use_micro_sdpa);
 
         if (rt_params->stage == PagedAttentionStage::GENERATE) {
@@ -1860,6 +1869,27 @@ public:
         const auto& intermediates_memories = instance.get_intermediates_memories();
         mem_lock<int32_t, mem_lock_type::read> past_lens_mem_lock(past_lens_mem, stream);
         mem_lock<int32_t, mem_lock_type::read> subsequence_begins_mem_lock(subsequence_begins_mem, stream);
+        mem_lock<int32_t, mem_lock_type::read> query_begins_lock(instance.query_subsequence_begins_memory_ptr(), stream);
+        if (desc->has_query_subsequence_begins) {
+            const auto num_sequences = past_lens_mem_lock.size();
+            OPENVINO_ASSERT(subsequence_begins_mem_lock.size() == num_sequences + 1 &&
+                                query_begins_lock.size() == num_sequences + 1,
+                            "[GPU] Asymmetric PA requires one boundary per sequence plus the end boundary");
+            OPENVINO_ASSERT(subsequence_begins_mem_lock[0] == 0 && query_begins_lock[0] == 0 &&
+                                subsequence_begins_mem_lock[num_sequences] >= 0 &&
+                                static_cast<size_t>(subsequence_begins_mem_lock[num_sequences]) ==
+                                    instance.get_impl_params()->get_input_layout(PagedAttentionInputIdx::KEY).get_shape()[0] &&
+                                query_begins_lock[num_sequences] >= 0 &&
+                                static_cast<size_t>(query_begins_lock[num_sequences]) ==
+                                    instance.get_impl_params()->get_input_layout(PagedAttentionInputIdx::QUERY).get_shape()[0],
+                            "[GPU] Asymmetric PA boundaries must cover the packed Q/K/V tensors");
+            for (size_t s = 0; s < num_sequences; ++s) {
+                const auto q_len = query_begins_lock[s + 1] - query_begins_lock[s];
+                const auto kv_len = subsequence_begins_mem_lock[s + 1] - subsequence_begins_mem_lock[s];
+                OPENVINO_ASSERT(q_len >= 0 && kv_len >= q_len && past_lens_mem_lock[s] >= 0,
+                                "[GPU] Each query subsequence must be a suffix of current K/V");
+            }
+        }
         std::unique_ptr<mem_lock<int32_t, mem_lock_type::write>> subsequence_offsets_lock = nullptr;
         std::unique_ptr<mem_lock<int32_t, mem_lock_type::write>> cumulative_window_size_sum_lock = nullptr;
 
@@ -2002,8 +2032,9 @@ public:
 
             if (micro_sdpa_block_starts_and_gws_mapping_lock) {
                 const auto block_size = static_cast<int>(query_block_size);
-                for (int32_t j = 0; j < seq_length; j += block_size) {
-                    auto block_start_pos = subsequence_begins_mem_lock[i] + j;
+                const auto query_length = query_begins_lock[i + 1] - query_begins_lock[i];
+                for (int32_t j = 0; j < query_length; j += block_size) {
+                    auto block_start_pos = query_begins_lock[i] + j;
                     micro_sdpa_block_starts_and_gws_mapping_lock->operator[](micro_sdpa_index++) = block_start_pos;
                     micro_sdpa_block_starts_and_gws_mapping_lock->operator[](micro_sdpa_index++) = static_cast<int32_t>(i);
                 }

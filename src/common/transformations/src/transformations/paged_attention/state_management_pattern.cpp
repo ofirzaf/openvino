@@ -557,10 +557,18 @@ ov::pass::StateManagementPattern::StateManagementPattern(PaParams& pa_params,
         enable_keep_const_precision(v_parameter);
 
         auto kv_transpose_order = v0::Constant::create(element::i64, Shape{4}, {0, 2, 1, 3});
-
+        const bool asymmetric_queries = options.use_asymmetric_inputs;
+        const auto query_begins = asymmetric_queries ? pa_params["query_subsequence_begins"] : nullptr;
+        OPENVINO_ASSERT(!asymmetric_queries ||
+                            (real_q.get_partial_shape().rank() == 4 && real_q.get_partial_shape()[0] == 1),
+                        "Packed PA requires queries with shape [1, heads, tokens, head_size]");
         auto q_transpose = std::make_shared<v1::Transpose>(real_q, kv_transpose_order);
-        auto q_reshape =
-            std::make_shared<v1::Reshape>(q_transpose, v0::Constant::create(element::i64, Shape{2}, {0, -1}), true);
+        const auto q_heads = asymmetric_queries ? real_q.get_partial_shape()[-3] : ov::Dimension::dynamic();
+        OPENVINO_ASSERT(!asymmetric_queries || q_heads.is_static(), "Asymmetric PA requires static query heads");
+        auto q_shape = asymmetric_queries
+                           ? v0::Constant::create<int64_t>(element::i64, Shape{2}, {-1, q_heads.get_length() * k_head_size})
+                           : v0::Constant::create(element::i64, Shape{2}, {0, -1});
+        auto q_reshape = std::make_shared<v1::Reshape>(q_transpose, q_shape, !asymmetric_queries);
 
         ov::Output<ov::Node> k_target_layout, v_target_layout;
         if (m.get_pattern_map().count(qkv_current_split_node)) {
@@ -619,10 +627,20 @@ ov::pass::StateManagementPattern::StateManagementPattern(PaParams& pa_params,
             v_target_layout = std::make_shared<v1::Transpose>(real_v, v_transpose_order);
         }
 
-        auto k_reshape =
-            std::make_shared<v1::Reshape>(k_target_layout, v0::Constant::create(element::i64, Shape{2}, {0, -1}), true);
-        auto v_reshape =
-            std::make_shared<v1::Reshape>(v_target_layout, v0::Constant::create(element::i64, Shape{2}, {0, -1}), true);
+        OPENVINO_ASSERT(!asymmetric_queries ||
+                            (k_target_layout.get_partial_shape().rank() == 4 &&
+                             v_target_layout.get_partial_shape().rank() == 4 &&
+                             k_target_layout.get_partial_shape()[0] == 1 &&
+                             v_target_layout.get_partial_shape()[0] == 1),
+                        "Packed PA requires K/V with shape [1, heads, tokens, head_size]");
+        auto k_shape = asymmetric_queries
+                           ? v0::Constant::create<int64_t>(element::i64, Shape{2}, {-1, num_k_heads * k_head_size})
+                           : v0::Constant::create(element::i64, Shape{2}, {0, -1});
+        auto v_shape = asymmetric_queries
+                           ? v0::Constant::create<int64_t>(element::i64, Shape{2}, {-1, num_v_heads * v_head_size})
+                           : v0::Constant::create(element::i64, Shape{2}, {0, -1});
+        auto k_reshape = std::make_shared<v1::Reshape>(k_target_layout, k_shape, !asymmetric_queries);
+        auto v_reshape = std::make_shared<v1::Reshape>(v_target_layout, v_shape, !asymmetric_queries);
 
         Output<Node> q_to_pa = q_reshape;
         Output<Node> k_to_pa = k_reshape;
@@ -848,11 +866,13 @@ ov::pass::StateManagementPattern::StateManagementPattern(PaParams& pa_params,
             pa_arguments.insert(pa_arguments.begin() + 24, v0::Constant::create(element::i32, Shape{0}, {}));
         }
 
-        // Meant to be used for Gemma family models with bidirectional image attention. If the condition is met for
+        // Prepared asymmetric graphs explicitly supply PA token types. Otherwise, require a
+        // mask dependency, as for Gemma models with bidirectional image attention. If the condition is met for
         // other models (ex. BERT) it's probably unintended behavior, as token_type_ids has been historically used
         // in different contexts.
         auto token_type_ids_param = pa_params.get("token_type_ids");
-        if (token_type_ids_param && depends_on(sdpa_node->input_value(3), token_type_ids_param.get())) {
+        if (token_type_ids_param &&
+            (asymmetric_queries || depends_on(sdpa_node->input_value(3), token_type_ids_param.get()))) {
             std::shared_ptr<ov::Node> token_type_ids = token_type_ids_param;
             if (token_type_ids->get_element_type() != element::i32) {
                 token_type_ids = std::make_shared<v0::Convert>(token_type_ids, element::i32);
@@ -878,6 +898,9 @@ ov::pass::StateManagementPattern::StateManagementPattern(PaParams& pa_params,
             pa_arguments.insert(pa_arguments.begin() + 27, v0::Constant::create(element::i32, Shape{0}, {}));
         }
         OPENVINO_ASSERT(pa_arguments.size() == 28);
+        if (asymmetric_queries) {
+            pa_arguments.push_back(query_begins);
+        }
 
         auto paged_attention =
             std::make_shared<ov::op::PagedAttentionExtension>(pa_arguments, kv_params.write_kv_cache);
@@ -900,7 +923,11 @@ ov::pass::StateManagementPattern::StateManagementPattern(PaParams& pa_params,
                 std::make_shared<v0::Unsqueeze>(hidden_dim_v, v0::Constant::create(element::i64, Shape{}, {0})),
             },
             0);
-        auto pa_reshape = std::make_shared<v1::Reshape>(paged_attention->output(0), pa_shape, true);
+        std::shared_ptr<Node> output_shape = pa_shape;
+        if (asymmetric_queries) {
+            output_shape = v0::Constant::create<int64_t>(element::i64, Shape{4}, {1, -1, q_heads.get_length(), v_head_size});
+        }
+        auto pa_reshape = std::make_shared<v1::Reshape>(paged_attention->output(0), output_shape, !asymmetric_queries);
         auto pa_transpose = std::make_shared<v1::Transpose>(pa_reshape, kv_transpose_order);
         if (options.use_score_outputs) {
             auto score_name = "scores." + std::to_string(m_layer_index);

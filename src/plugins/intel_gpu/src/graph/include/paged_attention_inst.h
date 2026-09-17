@@ -30,6 +30,10 @@ public:
             input_ports.insert(PagedAttentionInputIdx::SCORE_AGGREGATION);
         }
 
+        if (typed_desc()->has_query_subsequence_begins) {
+            input_ports.insert(PagedAttentionInputIdx::QUERY_SUBSEQUENCE_BEGINS);
+        }
+
         if (typed_desc()->has_adaptive_rkv) {
             input_ports.insert(PagedAttentionInputIdx::ADAPTIVE_RKV_START_SIZE);
             input_ports.insert(PagedAttentionInputIdx::ADAPTIVE_RKV_EVICTABLE_SIZES);
@@ -69,6 +73,11 @@ public:
     memory::ptr value_cache_memory_ptr() const { return input_memory_ptr(PagedAttentionInputIdx::VALUE_CACHE); }
     memory::ptr past_lens_memory_ptr() const { return input_memory_ptr(PagedAttentionInputIdx::PAST_LENS); }
     memory::ptr subsequence_begins_memory_ptr() const { return input_memory_ptr(PagedAttentionInputIdx::SUBSEQUENCE_BEGINS); }
+    memory::ptr query_subsequence_begins_memory_ptr() const {
+        return input_memory_ptr(get_typed_desc<paged_attention>()->has_query_subsequence_begins
+                                    ? PagedAttentionInputIdx::QUERY_SUBSEQUENCE_BEGINS
+                                    : PagedAttentionInputIdx::SUBSEQUENCE_BEGINS);
+    }
     memory::ptr block_indices_memory_ptr() const { return input_memory_ptr(PagedAttentionInputIdx::BLOCK_INDICES); }
     memory::ptr block_indices_begins_memory_ptr() const { return input_memory_ptr(PagedAttentionInputIdx::BLOCK_INDICES_BEGINS); }
     memory::ptr alibi_memory_ptr() const { return input_memory_ptr(PagedAttentionInputIdx::ALIBI); }

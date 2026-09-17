@@ -70,6 +70,8 @@ ov::pass::SDPAToPagedAttention::SDPAToPagedAttention(bool use_per_layer_block_in
                 allow_adaptive_rkv,
                 allow_qq_bias} {}
 
+ov::pass::SDPAToPagedAttention::SDPAToPagedAttention(const paged_attention::Options& options) : m_options(options) {}
+
 bool ov::pass::SDPAToPagedAttention::run_on_model(const std::shared_ptr<ov::Model>& model) {
     RUN_ON_MODEL_SCOPE(SDPAToPagedAttention);
 
@@ -91,6 +93,28 @@ bool ov::pass::SDPAToPagedAttention::run_on_model(const std::shared_ptr<ov::Mode
     m_params.add("block_indices_begins", element::i32, PartialShape{-1});
     if (!m_options.use_per_layer_block_indices_inputs) {
         m_params.add("block_indices", element::i32, PartialShape{-1});
+    }
+
+    if (m_options.use_asymmetric_inputs) {
+        // The caller has already packed the graph as [1, heads, tokens, head_size]
+        // and owns its position/embedding adaptation and attention-mask contract.
+        m_params.add("query_subsequence_begins", element::i32, PartialShape{-1});
+        std::unordered_set<std::string> converted_variables;
+        ov::pass::Manager manager("Packed SDPA to PA");
+        manager.set_per_pass_validation(false);
+        manager.register_pass<StateManagementPattern>(m_params, m_results, m_options, converted_variables);
+        manager.run_passes(model);
+        const auto sinks = model->get_sinks();
+        for (const auto& sink : sinks) {
+            if (auto assign = ov::as_type_ptr<ov::op::util::AssignBase>(sink)) {
+                if (converted_variables.count(assign->get_variable_id()))
+                    model->remove_sink(sink);
+            }
+        }
+        model->add_parameters(m_params.items());
+        model->add_results(m_results.items());
+        model->validate_nodes_and_infer_types();
+        return true;
     }
 
     std::shared_ptr<v0::Parameter> input_ids_node;

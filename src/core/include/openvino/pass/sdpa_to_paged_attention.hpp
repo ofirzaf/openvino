@@ -27,6 +27,14 @@ struct Options {
     bool allow_xattention;
     bool allow_adaptive_rkv;
     bool allow_qq_bias;
+    // The caller supplies a graph with Q/K/V shaped [1, heads, tokens, head_size]
+    // and independently packed query/current-KV rows. Skip input/position graph
+    // rewrites and add query_subsequence_begins (PA input 28). Each query range
+    // must be a suffix of its current-KV range. If token_type_ids is supplied,
+    // it explicitly describes PA masking for current-KV rows (input 25), even
+    // when the original SDPA mask did not depend on that parameter. The caller
+    // must validate its mask equivalence; recognized sliding windows still apply.
+    bool use_asymmetric_inputs = false;
 };
 
 template <typename NodeT, typename VectorT>
@@ -163,6 +171,7 @@ public:
                                   bool allow_xattention = false,
                                   bool allow_adaptive_rkv = false,
                                   bool allow_qq_bias = false);
+    explicit SDPAToPagedAttention(const paged_attention::Options& options);
     bool run_on_model(const std::shared_ptr<ov::Model>& model) override;
 
 private:

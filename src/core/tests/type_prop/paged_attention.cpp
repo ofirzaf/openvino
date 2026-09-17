@@ -14,8 +14,12 @@
 #include "common_test_utils/test_assertions.hpp"
 #include "common_test_utils/type_prop.hpp"
 #include "openvino/core/type/element_type.hpp"
+#include "openvino/core/op_extension.hpp"
 #include "openvino/op/constant.hpp"
 #include "openvino/op/parameter.hpp"
+#include "openvino/pass/serialize.hpp"
+#include "openvino/runtime/core.hpp"
+#include "visitors/visitors.hpp"
 
 namespace ov {
 namespace testing {
@@ -73,6 +77,76 @@ ov::OutputVector make_valid_pa_args(const element::Type& t = element::f32) {
             qq_bias_begins};
 }
 }  // namespace
+TEST(type_prop, paged_attention_asymmetric_query_rows) {
+    auto args = make_valid_pa_args();
+    args[0] = std::make_shared<op::v0::Parameter>(element::f32, PartialShape{3, 8});
+    args[1] = std::make_shared<op::v0::Parameter>(element::f32, PartialShape{11, 4});
+    args[2] = std::make_shared<op::v0::Parameter>(element::f32, PartialShape{11, 4});
+    args.push_back(std::make_shared<op::v0::Parameter>(element::i32, PartialShape{4}));
+    auto pa = std::make_shared<op::PagedAttentionExtension>(args);
+    EXPECT_EQ(pa->get_output_partial_shape(0), (PartialShape{3, 8}));
+    auto clone = pa->clone_with_new_inputs(args);
+    EXPECT_EQ(clone->get_input_size(), 29);
+    EXPECT_EQ(clone->get_output_partial_shape(0), pa->get_output_partial_shape(0));
+}
+
+TEST(type_prop, paged_attention_asymmetric_ir_roundtrip) {
+    auto args = make_valid_pa_args();
+    args[0] = std::make_shared<op::v0::Parameter>(element::f32, PartialShape{3, 8});
+    args[1] = std::make_shared<op::v0::Parameter>(element::f32, PartialShape{11, 4});
+    args[2] = std::make_shared<op::v0::Parameter>(element::f32, PartialShape{11, 4});
+    args.push_back(std::make_shared<op::v0::Parameter>(element::i32, PartialShape{4}));
+    ParameterVector parameters;
+    for (const auto& arg : args)
+        parameters.push_back(ov::as_type_ptr<op::v0::Parameter>(arg.get_node_shared_ptr()));
+    auto pa = std::make_shared<op::PagedAttentionExtension>(args, false);
+    auto model = std::make_shared<Model>(OutputVector{pa->output(0)}, parameters);
+    std::stringstream xml, weights;
+    pass::Serialize(xml, weights).run_on_model(model);
+    Core core;
+    core.add_extension(std::make_shared<OpExtension<op::PagedAttentionExtension>>());
+    auto restored = core.read_model(xml.str(), Tensor());
+    auto restored_pa = ov::as_type_ptr<op::PagedAttentionExtension>(restored->output().get_node()->input_value(0).get_node_shared_ptr());
+    ASSERT_NE(restored_pa, nullptr);
+    EXPECT_EQ(restored_pa->get_input_size(), 29);
+    EXPECT_EQ(restored_pa->get_input_partial_shape(28), (PartialShape{4}));
+    EXPECT_EQ(restored_pa->get_output_partial_shape(0), (PartialShape{3, 8}));
+    EXPECT_FALSE(restored_pa->get_write_kv_cache());
+}
+
+TEST(type_prop, paged_attention_asymmetric_boundary_count_mismatch) {
+    auto args = make_valid_pa_args();
+    args.push_back(std::make_shared<op::v0::Parameter>(element::i32, PartialShape{3}));
+    OV_EXPECT_THROW(std::make_shared<op::PagedAttentionExtension>(args),
+                    NodeValidationFailure,
+                    HasSubstr("subsequence boundaries must have the same length"));
+}
+
+TEST(type_prop, paged_attention_asymmetric_attribute_roundtrip) {
+    auto args = make_valid_pa_args();
+    args[0] = std::make_shared<op::v0::Parameter>(element::f32, PartialShape{3, 8});
+    args[1] = std::make_shared<op::v0::Parameter>(element::f32, PartialShape{11, 4});
+    args[2] = std::make_shared<op::v0::Parameter>(element::f32, PartialShape{11, 4});
+    args.push_back(std::make_shared<op::v0::Parameter>(element::i32, PartialShape{4}));
+    auto pa = std::make_shared<op::PagedAttentionExtension>(args);
+    ov::test::NodeBuilder::opset().insert<op::PagedAttentionExtension>();
+    ov::test::NodeBuilder builder(pa, args);
+    auto restored = ov::as_type_ptr<op::PagedAttentionExtension>(builder.create());
+    ASSERT_NE(restored, nullptr);
+    EXPECT_EQ(restored->get_input_size(), 29);
+    EXPECT_EQ(restored->get_output_element_type(0), element::f32);
+    EXPECT_EQ(restored->get_output_partial_shape(0), (PartialShape{3, 8}));
+}
+
+TEST(type_prop, paged_attention_asymmetric_query_exceeds_kv) {
+    auto args = make_valid_pa_args();
+    args[0] = std::make_shared<op::v0::Parameter>(element::f32, PartialShape{4, 4});
+    args.push_back(std::make_shared<op::v0::Parameter>(element::i32, PartialShape{4}));
+    OV_EXPECT_THROW(std::make_shared<op::PagedAttentionExtension>(args),
+                    NodeValidationFailure,
+                    HasSubstr("Query token count must not exceed"));
+}
+
 TEST(type_prop, paged_attention_static_eviction_per_block) {
     const auto query = std::make_shared<op::v0::Parameter>(element::f32, PartialShape{3, 4});
     const auto key = std::make_shared<op::v0::Parameter>(element::f32, PartialShape{3, 4});
@@ -315,7 +389,7 @@ TEST(type_prop, paged_attention_invalid_input_count) {
     args.pop_back();  // 27 instead of 28
     OV_EXPECT_THROW(std::ignore = std::make_shared<op::PagedAttentionExtension>(args),
                     ov::NodeValidationFailure,
-                    HasSubstr("28 inputs"));
+                    HasSubstr("28 or 29 inputs"));
 }
 
 TEST(type_prop, paged_attention_invalid_past_lens_rank) {

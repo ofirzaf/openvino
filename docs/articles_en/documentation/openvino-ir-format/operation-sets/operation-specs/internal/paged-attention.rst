@@ -508,6 +508,19 @@ are used at the time the model is built or compiled.
   **Required (always present; empty tensor = disabled).**
 
 
+* **28**: ``query_subsequence_begins`` - optional 1D tensor of type ``i32``, shape
+  ``[B_seq+1]``. Independently partitions query and output rows when the current
+  K/V input contains more rows than the query input. Input 6 continues to partition
+  current K/V rows. Boundaries start at zero, are nondecreasing, and cover their
+  respective inputs completely. Each request must have at least as many current
+  K/V rows as query rows. Queries correspond to the suffix of its current K/V:
+  query ``j`` has position ``past_lens[s] + KV_length[s] - Q_length[s] + j``.
+  Token types are indexed by current K/V row and describe masking only; they do
+  not specify request boundaries or which cache rows to retain. Every current
+  K/V row is appended to the cache. Omitting input 28 preserves the shared Q/K/V
+  boundaries of the 28-input operation.
+
+
 **Outputs**
 
 * **0**: ``attention_output`` - 2D tensor of type *T* (or the type set by ``set_out_type(0,…)``),
@@ -832,10 +845,11 @@ configurations.
   output in the CPU plugin (see note 1 above for details).  Decode steps are not
   affected.
 
-* Bidirectional image attention (``token_type_ids``) is supported only by the CPU
-  plugin.  The GPU plugin and the reference (TEMPLATE) implementation
-  both ignore the ``token_type_ids`` input: the tensor is accepted without error but has
-  no effect on the attention computation, and all tokens use standard causal attention.
+* Bidirectional attention groups (``token_type_ids``) are supported by the CPU,
+  GPU OpenCL micro-SDPA, and reference (TEMPLATE) implementations. Groups are
+  confined to each request's current K/V interval. The GPU micro-SDPA and reference
+  implementations support groups with nonzero past and asymmetric queries.
+  The GPU CM implementation does not support asymmetric queries.
 
 
 **CPU plugin KV-cache quantization properties**

@@ -16,7 +16,10 @@ template <class TShape, class TRShape = result_shape_t<TShape>>
 std::vector<TRShape> shape_infer(const PagedAttentionExtension* op,
                                  const std::vector<TShape>& input_shapes,
                                  const ITensorAccessor& ta = make_tensor_accessor()) {
-    NODE_VALIDATION_CHECK(op, input_shapes.size() == 28, "Expected 28 inputs but got ", input_shapes.size());
+    NODE_VALIDATION_CHECK(op,
+                          input_shapes.size() == 28 || input_shapes.size() == 29,
+                          "Expected 28 or 29 inputs but got ",
+                          input_shapes.size());
     auto output_shapes = std::vector<TRShape>(3);
 
     // Output[0] feature dim is num_heads * v_head_size.
@@ -26,6 +29,27 @@ std::vector<TRShape> shape_infer(const PagedAttentionExtension* op,
     const auto& value_ps = input_shapes[2];
     const auto& past_lens_ps = input_shapes[5];
     const auto& evictable_sizes_ps = input_shapes[22];
+
+    if (input_shapes.size() == 29) {
+        const auto& query_begins_ps = input_shapes[28];
+        const auto& kv_begins_ps = input_shapes[6];
+        if (query_begins_ps.rank().is_static() && kv_begins_ps.rank().is_static()) {
+            NODE_VALIDATION_CHECK(op,
+                                  query_begins_ps[0].compatible(kv_begins_ps[0]),
+                                  "Query and K/V subsequence boundaries must have the same length");
+        }
+        if (key_ps.rank().is_static() && value_ps.rank().is_static()) {
+            NODE_VALIDATION_CHECK(op,
+                                  key_ps[0].compatible(value_ps[0]),
+                                  "Key and value must have the same token count");
+        }
+        if (out_ps.rank().is_static() && key_ps.rank().is_static() && out_ps[0].is_static() &&
+            key_ps[0].is_static()) {
+            NODE_VALIDATION_CHECK(op,
+                                  out_ps[0].get_length() <= key_ps[0].get_length(),
+                                  "Query token count must not exceed current K/V token count");
+        }
+    }
 
     // Compute for output shape
     if (out_ps.rank().is_static() && out_ps.rank().get_length() >= 2 && out_ps[1].is_static()) {

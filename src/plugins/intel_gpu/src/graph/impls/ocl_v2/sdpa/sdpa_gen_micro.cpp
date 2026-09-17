@@ -214,7 +214,10 @@ inline ov::Dimension micro_get_aligned_seq_length(const kernel_impl_params& para
     if (params.is_type<paged_attention>()) {
         const auto desc = params.typed_desc<paged_attention>();
         const auto& input_mem = params.memory_deps;
-        const auto subsequence_begins_mem = input_mem.at(paged_attention::PagedAttentionInputIdx::SUBSEQUENCE_BEGINS);
+        const auto begins_idx = qkv_idx == 0 && desc->has_query_subsequence_begins
+                                    ? PagedAttentionInputIdx::QUERY_SUBSEQUENCE_BEGINS
+                                    : PagedAttentionInputIdx::SUBSEQUENCE_BEGINS;
+        const auto subsequence_begins_mem = input_mem.at(begins_idx);
         mem_lock<int32_t, mem_lock_type::read> subsequence_begins_mem_lock(subsequence_begins_mem, *params.strm);
         auto aligned_seq_len = 0;
         for (size_t i = 0; i < subsequence_begins_mem_lock.size() - 1; i++) {
@@ -1200,7 +1203,8 @@ JitConstants SDPAMicroGenerator::get_jit_constants(const kernel_impl_params& par
         jit.make("WITH_ATTN_MASK", 0);
         jit.make("PAGED_ATTENTION_BLOCK_SIZE", config.paged_attention_block_size);
         const auto desc = params.typed_desc<paged_attention>();
-        if (desc->has_token_type_ids && m_is_prefill) {
+        jit.make("HAS_QUERY_SUBSEQUENCE_BEGINS", desc->has_query_subsequence_begins);
+        if (desc->has_token_type_ids) {
             jit.make("HAS_TOKEN_TYPE_IDS", 1);
         }
     }
@@ -1480,6 +1484,9 @@ Arguments SDPAMicroGenerator::get_arguments_desc(const kernel_impl_params& param
         args.push_back({ArgumentDescriptor::Types::OUTPUT, 0});  // A
 
         args.push_back({ArgumentDescriptor::Types::INPUT, PagedAttentionInputIdx::SUBSEQUENCE_BEGINS});  // subsequence_begins
+        if (desc->has_query_subsequence_begins) {
+            args.push_back({ArgumentDescriptor::Types::INPUT, PagedAttentionInputIdx::QUERY_SUBSEQUENCE_BEGINS});
+        }
         if (!m_is_prefill) {
             args.push_back({ArgumentDescriptor::Types::INPUT, 5});  // past_lens
             args.push_back({ArgumentDescriptor::Types::INPUT, 7});  // block_indices
@@ -1499,7 +1506,7 @@ Arguments SDPAMicroGenerator::get_arguments_desc(const kernel_impl_params& param
                 {ArgumentDescriptor::Types::INPUT, PagedAttentionInputIdx::QQ_BIAS_BEGINS});  // qq_bias_begins                              // qq_bias_num
         }
 
-        if (desc->has_token_type_ids && m_is_prefill) {
+        if (desc->has_token_type_ids) {
             args.push_back({ArgumentDescriptor::Types::INPUT, PagedAttentionInputIdx::TOKEN_TYPE_IDS});  // token_type_ids
         }
 

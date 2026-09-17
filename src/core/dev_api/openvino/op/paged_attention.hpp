@@ -23,7 +23,7 @@ public:
 
     /// \brief Constructs a PagedAttentionExtension.
     ///
-    /// \param args 28 inputs (see spec for layout):
+    /// \param args 28 or 29 inputs (see spec for layout):
     ///   (B_token = total tokens in the call, B_seq = number of sequences,
     ///    H = query heads, Hk = key/value heads, S = head size)
     ///
@@ -55,6 +55,16 @@ public:
     /// 25  token_type_ids                                   [B_token] or [B_token, 1], i32  optional
     /// 26  qq_bias                                          [total_bias_bytes], u8    optional
     /// 27  qq_bias_begins                                   [B_seq + 1], i32          optional
+    /// 28  query_subsequence_begins                         [B_seq + 1], i32          optional
+    ///
+    /// When input 28 is present, query has B_query rows, while key, value and
+    /// token_type_ids have B_token rows. Input 6 partitions current K/V rows;
+    /// input 28 partitions query/output rows. Each query subsequence corresponds
+    /// to the suffix of its current K/V subsequence (Q_len <= KV_len), so query
+    /// position j is past_lens[s] + KV_len[s] - Q_len[s] + j. Cached token types
+    /// are implicitly zero. Omitting input 28 retains the original Q_len=KV_len
+    /// contract. This allows context K/V updates followed by bidirectional
+    /// proposal queries without computing dummy queries for the context.
     explicit PagedAttentionExtension(const ov::OutputVector& args, bool write_kv_cache = true);
 
     void validate_and_infer_types() override;
