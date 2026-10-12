@@ -175,10 +175,20 @@ KERNEL(pa_sdpa_opt)(
     #if HAS_TOKEN_TYPE_IDS
         // A token of type 1 attends bidirectionally within its contiguous run of type-1 tokens
         // (an image, a speculative block), so it sees the new tokens up to the end of that run.
+        const bool is_image_token = token_type_ids[seq_idx] == 1;
         uint token_type_run_end = seq_idx + 1;
-        if (token_type_ids[seq_idx] == 1) {
+        #if SLIDING_WINDOW_SIZE != 0
+            uint token_type_run_begin = seq_idx;
+        #endif
+        if (is_image_token) {
             while (token_type_run_end < subsequence_end && token_type_ids[token_type_run_end] == 1)
                 token_type_run_end++;
+            #if SLIDING_WINDOW_SIZE != 0
+                if (causal_seq_len - past_len > SLIDING_WINDOW_SIZE) {
+                    while (token_type_run_begin > subsequence_begin && token_type_ids[token_type_run_begin - 1] == 1)
+                        token_type_run_begin--;
+                }
+            #endif
         }
         const uint seq_len = past_len + (token_type_run_end - subsequence_begin);
     #else
@@ -193,6 +203,14 @@ KERNEL(pa_sdpa_opt)(
     const uint subsequence_idx = seq_idx;
     const uint seq_len = past_lens[seq_idx] + 1;
     const uint causal_seq_len = seq_len;
+#endif
+
+#if SLIDING_WINDOW_SIZE != 0
+    uint sliding_window_begin = causal_seq_len > SLIDING_WINDOW_SIZE ? causal_seq_len - SLIDING_WINDOW_SIZE : 0;
+    #if MULTI_TOKENS_PROCESSING && HAS_TOKEN_TYPE_IDS
+        if (is_image_token)
+            sliding_window_begin = min(sliding_window_begin, past_len + (token_type_run_begin - subsequence_begin));
+    #endif
 #endif
 
     const uint partition_idx = get_group_id(2);
@@ -459,7 +477,7 @@ KERNEL(pa_sdpa_opt)(
 #endif
 
 #if SLIDING_WINDOW_SIZE != 0
-            if (token_idx >= seq_len || (causal_seq_len > SLIDING_WINDOW_SIZE && token_idx < (causal_seq_len - SLIDING_WINDOW_SIZE)))
+            if (token_idx >= seq_len || token_idx < sliding_window_begin)
 #else
             if (token_idx >= seq_len)
 #endif
