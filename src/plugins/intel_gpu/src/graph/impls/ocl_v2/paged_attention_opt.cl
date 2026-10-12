@@ -217,8 +217,12 @@ KERNEL(pa_sdpa_opt)(
 
     const uint total_blocks_num = CEIL_DIV(seq_len, PAGED_ATTENTION_BLOCK_SIZE);
 
-#if SWA_BLOCK_SKIP_ENABLED && !MULTI_TOKENS_PROCESSING
+#if SWA_BLOCK_SKIP_ENABLED
+    #if MULTI_TOKENS_PROCESSING
+    const uint swa_start_block = sliding_window_begin / PAGED_ATTENTION_BLOCK_SIZE;
+    #else
     const uint swa_start_block = (seq_len > SLIDING_WINDOW_SIZE) ? ((seq_len - SLIDING_WINDOW_SIZE) / PAGED_ATTENTION_BLOCK_SIZE) : 0;
+    #endif
     const uint swa_start_token = swa_start_block * PAGED_ATTENTION_BLOCK_SIZE;
     const uint effective_blocks_num = total_blocks_num - swa_start_block;
 #else
@@ -694,7 +698,7 @@ KERNEL(pa_sdpa_opt)(
         MAKE_VECTOR_TYPE(OUTPUT_TYPE, QUERIES_PER_WI) acc = OUTPUT_VAL_ZERO;
 #endif
 
-#if SWA_BLOCK_SKIP_ENABLED && !MULTI_TOKENS_PROCESSING
+#if SWA_BLOCK_SKIP_ENABLED
         const uint effective_seq_len = seq_len - swa_start_token;
 #else
         const uint effective_seq_len = seq_len;
@@ -1078,8 +1082,24 @@ KERNEL(pa_sdpa_finalization_stage)(
     const uint seq_len = past_lens[seq_idx] + 1;
 #endif
 
-#if SWA_BLOCK_SKIP_ENABLED && !MULTI_TOKENS_PROCESSING
+#if SWA_BLOCK_SKIP_ENABLED
+    #if MULTI_TOKENS_PROCESSING
+    // same window start as in pa_sdpa_opt, so both kernels agree on the number of partitions
+    const uint past_len = past_lens[subsequence_idx];
+    const uint causal_seq_len = past_len + 1 + (seq_idx - subsequence_begin);
+    uint sliding_window_begin = causal_seq_len > SLIDING_WINDOW_SIZE ? causal_seq_len - SLIDING_WINDOW_SIZE : 0;
+        #if HAS_TOKEN_TYPE_IDS
+        if (token_type_ids[seq_idx] == 1 && causal_seq_len - past_len > SLIDING_WINDOW_SIZE) {
+            uint token_type_run_begin = seq_idx;
+            while (token_type_run_begin > subsequence_begin && token_type_ids[token_type_run_begin - 1] == 1)
+                token_type_run_begin--;
+            sliding_window_begin = min(sliding_window_begin, past_len + (token_type_run_begin - subsequence_begin));
+        }
+        #endif
+    const uint swa_start_block = sliding_window_begin / PAGED_ATTENTION_BLOCK_SIZE;
+    #else
     const uint swa_start_block = (seq_len > SLIDING_WINDOW_SIZE) ? ((seq_len - SLIDING_WINDOW_SIZE) / PAGED_ATTENTION_BLOCK_SIZE) : 0;
+    #endif
     const uint effective_seq_len = seq_len - swa_start_block * PAGED_ATTENTION_BLOCK_SIZE;
 #else
     const uint effective_seq_len = seq_len;
