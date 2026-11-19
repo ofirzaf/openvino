@@ -31,6 +31,7 @@ set(DEV_HEADERS
     ${CMAKE_CURRENT_LIST_DIR}/openvino/op/paged_sparse_attention.hpp
     ${CMAKE_CURRENT_LIST_DIR}/openvino/op/paged_causal_conv1d.hpp
     ${CMAKE_CURRENT_LIST_DIR}/openvino/op/paged_gated_delta_net.hpp
+    ${CMAKE_CURRENT_LIST_DIR}/openvino/op/paged_kv_cache_write.hpp
     ${CMAKE_CURRENT_LIST_DIR}/openvino/op/paged_qsa_indexer.hpp
     ${CMAKE_CURRENT_LIST_DIR}/openvino/op/paged_selective_ssm.hpp
     ${CMAKE_CURRENT_LIST_DIR}/openvino/op/paged_sparse_attention.hpp

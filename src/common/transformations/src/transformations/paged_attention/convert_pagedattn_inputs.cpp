@@ -14,6 +14,7 @@
 #include "openvino/op/paged_attention.hpp"
 #include "openvino/op/paged_causal_conv1d.hpp"
 #include "openvino/op/paged_gated_delta_net.hpp"
+#include "openvino/op/paged_kv_cache_write.hpp"
 #include "openvino/op/paged_selective_ssm.hpp"
 #include "openvino/op/paged_sparse_attention.hpp"
 #include "openvino/pass/pattern/op/wrap_type.hpp"
@@ -50,8 +51,17 @@ ConvertPagedAttnInputs::ConvertPagedAttnInputs(const KVCacheConfig& config,
             ov::is_type_any_of<ov::op::PagedAttentionExtension, ov::op::internal::PagedSparseAttention>(root) ? root
                                                                                                               : nullptr;
         if (pa_op) {
-            auto key_cache = ov::as_type_ptr<v0::Parameter>(pa_op->get_input_node_shared_ptr(3));
-            auto value_cache = ov::as_type_ptr<v0::Parameter>(pa_op->get_input_node_shared_ptr(4));
+            // A PagedKVCacheWrite between the cache Parameters and PA passes the caches through.
+            const auto cache_writer =
+                ov::as_type_ptr<ov::op::internal::PagedKVCacheWrite>(pa_op->get_input_node_shared_ptr(3));
+            const auto cache_source = [&](size_t pa_idx, size_t writer_idx) {
+                return cache_writer ? cache_writer->get_input_node_shared_ptr(writer_idx)
+                                    : pa_op->get_input_node_shared_ptr(pa_idx);
+            };
+            auto key_cache = ov::as_type_ptr<v0::Parameter>(
+                cache_source(3, ov::op::internal::PagedKVCacheWrite::KEY_CACHE));
+            auto value_cache = ov::as_type_ptr<v0::Parameter>(
+                cache_source(4, ov::op::internal::PagedKVCacheWrite::VALUE_CACHE));
             if (!key_cache || !value_cache) {
                 return false;
             }
@@ -143,6 +153,9 @@ ConvertPagedAttnInputs::ConvertPagedAttnInputs(const KVCacheConfig& config,
 
             key_cache->validate_and_infer_types();
             value_cache->validate_and_infer_types();
+            if (cache_writer) {
+                cache_writer->validate_and_infer_types();
+            }
         }
 
         if (const auto paged_conv = ov::as_type_ptr<ov::op::internal::PagedCausalConv1D>(root)) {

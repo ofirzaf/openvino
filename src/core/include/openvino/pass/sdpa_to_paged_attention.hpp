@@ -29,6 +29,10 @@ struct Options {
     bool allow_adaptive_rkv;
     bool allow_qq_bias;
     bool is_draft_model;  // Gemma4 MTP draft model
+    // Supports layers that append [key-only rows; query rows] to the KV cache: rows with keys and values but no
+    // query, then the rows that attend (e.g. a DFlash draft: context rows, then block rows). PagedKVCacheWrite
+    // stores the key-only rows and PagedAttention runs on the query rows only.
+    bool allow_kv_cache_write;
 };
 
 template <typename NodeT, typename VectorT>
@@ -165,7 +169,8 @@ public:
                                   bool allow_xattention = false,
                                   bool allow_adaptive_rkv = false,
                                   bool allow_qq_bias = false,
-                                  bool is_draft_model = false);
+                                  bool is_draft_model = false,
+                                  bool allow_kv_cache_write = false);
     bool run_on_model(const std::shared_ptr<ov::Model>& model) override;
 
 private:

@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "../utils/kernel_generator.hpp"
+#include "pa_kv_cache_update.hpp"
 #include "paged_attention_inst.h"
 #include "program_node.h"
 #include "registry/implementation_manager.hpp"
@@ -24,17 +25,14 @@ inline bool pa_micro_uses_tt_bounds(const paged_attention& desc) {
     return desc.has_token_type_ids && !desc.has_scores_output() && !desc.has_adaptive_rkv;
 }
 
-enum class PagedAttentionStage : uint8_t { GENERATE = 0, PREFILL = 1, MIXED = 2, UNKNOWN = 3 };
-
 // Kernel used for MIXED stage with few query tokens per subsequence (speculative decoding)
 enum class GQAMultiTokensKernel : uint8_t { NONE = 0, SMALL_Q = 1, FALLBACK = 2 };
 
-struct PagedAttentionRuntimeParams : public ImplRuntimeParams {
-    PagedAttentionStage stage;
+// stage and paged_attention_aligned_seq_len are in KVCacheUpdateRuntimeParams
+struct PagedAttentionRuntimeParams : public KVCacheUpdateRuntimeParams {
     size_t num_of_partitions;
     size_t partition_size;
     size_t max_context_len;
-    size_t paged_attention_aligned_seq_len;
     size_t sdpa_opt_seq_len_partition_size;
 
     size_t paged_attention_snap_kv_tokens;

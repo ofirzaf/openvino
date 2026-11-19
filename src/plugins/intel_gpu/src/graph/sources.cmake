@@ -181,6 +181,7 @@ set(GPU_GRAPH_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/include/paged_attention_inst.h
     ${CMAKE_CURRENT_LIST_DIR}/include/paged_causal_conv1d_inst.h
     ${CMAKE_CURRENT_LIST_DIR}/include/paged_gated_delta_net_inst.h
+    ${CMAKE_CURRENT_LIST_DIR}/include/paged_kv_cache_write_inst.h
     ${CMAKE_CURRENT_LIST_DIR}/include/paged_qsa_indexer_inst.h
     ${CMAKE_CURRENT_LIST_DIR}/include/paged_selective_ssm_inst.h
     ${CMAKE_CURRENT_LIST_DIR}/include/pass_manager.h
@@ -274,6 +275,7 @@ set(GPU_GRAPH_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/paged_attention.cpp
     ${CMAKE_CURRENT_LIST_DIR}/paged_causal_conv1d.cpp
     ${CMAKE_CURRENT_LIST_DIR}/paged_gated_delta_net.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/paged_kv_cache_write.cpp
     ${CMAKE_CURRENT_LIST_DIR}/paged_qsa_indexer.cpp
     ${CMAKE_CURRENT_LIST_DIR}/paged_selective_ssm.cpp
     ${CMAKE_CURRENT_LIST_DIR}/pass_manager.cpp
@@ -336,6 +338,7 @@ set(GPU_GRAPH_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/registry/paged_attention_impls.cpp
     ${CMAKE_CURRENT_LIST_DIR}/registry/paged_causal_conv1d_impls.cpp
     ${CMAKE_CURRENT_LIST_DIR}/registry/paged_gated_delta_net_impls.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/registry/paged_kv_cache_write_impls.cpp
     ${CMAKE_CURRENT_LIST_DIR}/registry/paged_qsa_indexer_impls.cpp
     ${CMAKE_CURRENT_LIST_DIR}/registry/paged_selective_ssm_impls.cpp
     ${CMAKE_CURRENT_LIST_DIR}/registry/pooling_impls.cpp

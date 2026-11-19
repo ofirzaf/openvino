@@ -47,6 +47,7 @@
 #include "mutable_data_inst.h"
 #include "non_max_suppression_inst.h"
 #include "paged_attention_inst.h"
+#include "paged_kv_cache_write_inst.h"
 #include "permute_inst.h"
 #include "pooling_inst.h"
 #include "program_helpers.h"
@@ -480,7 +481,7 @@ void primitive_inst::update_shape() {
         memory_deps.insert({i, dep_mem});
 
         // Ignore shape infer dependency for input_layout when processing paged_attention nodes
-        if (get_node().is_type<paged_attention>() && dep->get_node().is_type<input_layout>()) {
+        if ((get_node().is_type<paged_attention>() || get_node().is_type<paged_kv_cache_write>()) && dep->get_node().is_type<input_layout>()) {
             continue;
         }
 
@@ -2652,9 +2653,10 @@ void primitive_inst::prepare_primitive() {
             realloc_if_needed(prev_execution_skipped);
         }
 
-        // Paged Attention may require dispatch data update and internal buffers reallocation
-        // even if the input shapes haven't been changed
-        if (get_node().is_type<paged_attention>() && !get_flag(ExecutionFlags::IMPL_CHANGED) && _impl->requires_update(*this, *_impl_params)) {
+        // Paged Attention and the paged KV cache write may require dispatch data update and internal buffers
+        // reallocation even if the input shapes haven't been changed
+        if ((get_node().is_type<paged_attention>() || get_node().is_type<paged_kv_cache_write>()) && !get_flag(ExecutionFlags::IMPL_CHANGED) &&
+            _impl->requires_update(*this, *_impl_params)) {
             _impl->update(*this, *_impl_params);
             set_flag(ExecutionFlags::SHAPE_CHANGED);
 

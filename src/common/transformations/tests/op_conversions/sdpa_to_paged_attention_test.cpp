@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include <set>
+#include <unordered_set>
 
 #include "../common_optimizations/ssm_test_models.hpp"
 #include "common_test_utils/node_builders/constant.hpp"
@@ -43,6 +44,7 @@
 #include "openvino/op/mvn.hpp"
 #include "openvino/op/pad.hpp"
 #include "openvino/op/paged_attention.hpp"
+#include "openvino/op/paged_kv_cache_write.hpp"
 #include "openvino/op/power.hpp"
 #include "openvino/op/range.hpp"
 #include "openvino/op/reduce_mean.hpp"
@@ -65,6 +67,8 @@
 #include "openvino/op/transpose.hpp"
 #include "openvino/op/unsqueeze.hpp"
 #include "openvino/op/util/variable.hpp"
+#include "openvino/op/util/assign_base.hpp"
+#include "openvino/op/util/read_value_base.hpp"
 #include "openvino/op/variadic_split.hpp"
 #include "transformations/paged_attention/eliminate_conv_padding_mask_gating.hpp"
 #include "transformations/paged_attention/gemma4_mtp_state_management_pattern.hpp"
@@ -1083,6 +1087,211 @@ TEST(SDPAToPAKeepConstPrecisionTest, Qwen7bChat_KVCacheParamsMarkedKeepConstPrec
             }
         }
         EXPECT_GT(kv_cache_params_count, 0);
+    }
+}
+
+namespace {
+// One attention layer of a DFlash-like draft: the context rows (hidden_states) have keys and values only, the block
+// rows (inputs_embeds) attend. [context; block] is appended to the KV state. position_ids = [context; block].
+std::shared_ptr<ov::Model> gen_key_only_rows_model(bool gqa) {
+    const int q_heads = 4, kv_heads = gqa ? 2 : 4, head_size = 16;
+    auto inputs_embeds = ov::test::utils::make_param(element::f32, PartialShape{DYN, DYN, 64}, "inputs_embeds");
+    auto hidden_states = ov::test::utils::make_param(element::f32, PartialShape{DYN, DYN, 64}, "hidden_states");
+    auto position_ids = ov::test::utils::make_param(element::i64, PartialShape{DYN, DYN}, "position_ids");
+    auto attention_mask = ov::test::utils::make_param(element::i64, PartialShape{DYN, DYN}, "attention_mask");
+    auto beam_idx = ov::test::utils::make_param(element::i32, PartialShape{DYN}, "beam_idx");
+
+    auto num_rows = [](const std::shared_ptr<Node>& rows) {
+        auto shape = makeOP<v3::ShapeOf>({rows}, {{"output_type", "i64"}});
+        return makeOP<v8::Gather>({shape, {1}, 0}, {{"batch_dims", 0}});
+    };
+    auto lengths = makeOP<v0::Concat>({num_rows(hidden_states), num_rows(inputs_embeds)}, {{"axis", 0}});
+    auto positions = makeOP<v1::VariadicSplit>({position_ids, 1, lengths});
+
+    // [B, rows, hidden] -> [B, heads, rows, head_size], plus a stand-in for RoPE that depends on the positions
+    auto heads_of = [&](const std::shared_ptr<Node>& rows, int heads, const Output<Node>& rows_positions) {
+        auto weights = makeConst(element::f32, {64, static_cast<size_t>(heads * head_size)}, MOCK_VALUE);
+        auto proj = makeOP<v0::MatMul>({rows, weights}, {{"transpose_a", false}, {"transpose_b", false}});
+        auto split = makeOP<v1::Reshape>({proj, {0, 0, heads, head_size}}, {special_zero_true});
+        auto transposed = makeOP<v1::Transpose>({split, {0, 2, 1, 3}});
+        auto pos = makeOP<v0::Unsqueeze>({makeOP<v0::Convert>({rows_positions}, {dest_type_f32}), {1, 3}});
+        return makeOP<v1::Add>({transposed, pos}, {numpy_broadcast});
+    };
+
+    SinkVector sinks;
+    auto keys_or_values = [&](const std::string& name) -> std::shared_ptr<Node> {
+        auto cache = ::gen_cache(inputs_embeds, beam_idx, name, kv_heads, head_size);
+        auto key_only_rows = heads_of(hidden_states, kv_heads, positions->output(0));
+        auto query_rows = heads_of(inputs_embeds, kv_heads, positions->output(1));
+        auto new_rows = makeOP<v0::Concat>({key_only_rows, query_rows}, {{"axis", 2}});
+        auto state = makeOP<v0::Concat>({cache.past_gathered, new_rows}, {{"axis", 2}});
+        sinks.push_back(std::make_shared<v6::Assign>(state, cache.variable));
+        if (!gqa) {
+            return state;
+        }
+        // the stock repeat_kv
+        auto grouped = makeOP<v0::Unsqueeze>({state, 2});
+        auto repeated = makeOP<v3::Broadcast>({grouped, {1, 1, q_heads / kv_heads, 1, 1}}, {{"mode", "bidirectional"}});
+        return makeOP<v1::Reshape>({repeated, {0, q_heads, -1, head_size}}, {special_zero_true});
+    };
+
+    auto q = heads_of(inputs_embeds, q_heads, positions->output(1));
+    auto k = keys_or_values("K_cache");
+    auto v = keys_or_values("V_cache");
+    auto mask = makeConst(element::f32, {1, 1, 1, 1}, {0.f});
+    auto sdpa = std::make_shared<v13::ScaledDotProductAttention>(q, k, v, mask, false);
+    return std::make_shared<ov::Model>(ResultVector{std::make_shared<v0::Result>(sdpa)},
+                                       sinks,
+                                       ParameterVector{inputs_embeds, hidden_states, position_ids, attention_mask, beam_idx});
+}
+
+// Friendly names of the parameters a node depends on
+std::set<std::string> source_parameters(const Output<Node>& output) {
+    std::set<std::string> names;
+    std::unordered_set<const Node*> visited;
+    std::vector<const Node*> stack{output.get_node()};
+    while (!stack.empty()) {
+        auto node = stack.back();
+        stack.pop_back();
+        if (!visited.insert(node).second) {
+            continue;
+        }
+        if (ov::is_type<v0::Parameter>(node)) {
+            names.insert(node->get_friendly_name());
+        }
+        for (const auto& input : node->input_values()) {
+            stack.push_back(input.get_node());
+        }
+    }
+    return names;
+}
+
+void run_sdpa_to_pa(const std::shared_ptr<ov::Model>& model, bool allow_kv_cache_write) {
+    ov::pass::Manager manager;
+    manager.register_pass<ov::pass::SDPAToPagedAttention>(false,
+                                                          false,
+                                                          false,
+                                                          false,
+                                                          false,
+                                                          false,
+                                                          false,
+                                                          false,
+                                                          allow_kv_cache_write);
+    manager.run_passes(model);
+}
+}  // namespace
+
+// allow_kv_cache_write: a layer appends [context rows; block rows] to the KV state and attends from the block rows
+// only. PagedKVCacheWrite stores the context rows and feeds the caches to PagedAttention, which runs on the block
+// rows only and keeps its own parameters.
+class SDPAToPAKVCacheWriteTest : public testing::TestWithParam<bool> {};
+
+TEST_P(SDPAToPAKVCacheWriteTest, WriterStoresContextRows_PagedAttentionRunsOnBlockRows) {
+    auto model = gen_key_only_rows_model(GetParam());
+    run_sdpa_to_pa(model, true);
+
+    std::shared_ptr<ov::op::PagedAttentionExtension> pa;
+    std::shared_ptr<ov::op::internal::PagedKVCacheWrite> writer;
+    for (const auto& op : model->get_ordered_ops()) {
+        if (auto p = ov::as_type_ptr<ov::op::PagedAttentionExtension>(op)) {
+            ASSERT_FALSE(pa) << "expected one PagedAttentionExtension";
+            pa = p;
+        } else if (auto w = ov::as_type_ptr<ov::op::internal::PagedKVCacheWrite>(op)) {
+            ASSERT_FALSE(writer) << "expected one PagedKVCacheWrite";
+            writer = w;
+        }
+        EXPECT_FALSE(ov::is_type<ov::op::util::ReadValueBase>(op));
+        EXPECT_FALSE(ov::is_type<ov::op::util::AssignBase>(op));
+    }
+    ASSERT_TRUE(pa);
+    ASSERT_TRUE(writer);
+
+    // The writer's caches are the cache parameters, and PA reads them through the writer.
+    EXPECT_EQ(writer->get_input_node_ptr(2)->get_friendly_name(), "key_cache.0");
+    EXPECT_EQ(writer->get_input_node_ptr(3)->get_friendly_name(), "value_cache.0");
+    EXPECT_EQ(pa->input_value(3), writer->output(0));
+    EXPECT_EQ(pa->input_value(4), writer->output(1));
+    EXPECT_EQ(writer->get_rt_info().count("num_k_heads"), 1u);
+    EXPECT_EQ(pa->get_rt_info().at("num_k_heads").as<int64_t>(), GetParam() ? 2 : 4);
+
+    // The writer gets the context rows with their own positions; PA gets the block rows.
+    const std::set<std::string> context_sources{"hidden_states", "context_kv_position_ids"};
+    const std::set<std::string> block_sources{"inputs_embeds", "position_ids"};
+    for (size_t i = 0; i < 2; ++i) {
+        EXPECT_EQ(source_parameters(writer->input_value(i)), context_sources);
+    }
+    for (size_t i = 0; i < 3; ++i) {
+        EXPECT_EQ(source_parameters(pa->input_value(i)), block_sources);
+        EXPECT_EQ(pa->get_input_partial_shape(i), (PartialShape{DYN, i == 0 ? 64 : (GetParam() ? 32 : 64)}));
+    }
+    // PagedAttention stores its block rows, as for any other model.
+    EXPECT_TRUE(pa->get_write_kv_cache());
+    // Block rows attend to each other in both directions: token type 1 on every row.
+    EXPECT_EQ(source_parameters(pa->input_value(25)), block_sources);
+    EXPECT_EQ(pa->get_input_element_type(25), element::i32);
+    EXPECT_EQ(pa->get_input_partial_shape(25), PartialShape{DYN});
+
+    // PA keeps its parameters; the writer gets the kv_write_* ones.
+    const std::vector<std::pair<size_t, std::string>> pa_params{{5, "past_lens"},
+                                                                {6, "subsequence_begins"},
+                                                                {7, "block_indices"},
+                                                                {8, "block_indices_begins"}};
+    for (const auto& [idx, name] : pa_params) {
+        EXPECT_EQ(pa->get_input_node_ptr(idx)->get_friendly_name(), name);
+    }
+    const std::vector<std::pair<size_t, std::string>> writer_params{{4, "kv_write_past_lens"},
+                                                                    {5, "kv_write_subsequence_begins"},
+                                                                    {6, "kv_write_block_indices"},
+                                                                    {7, "kv_write_block_indices_begins"}};
+    for (const auto& [idx, name] : writer_params) {
+        EXPECT_EQ(writer->get_input_node_ptr(idx)->get_friendly_name(), name);
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(SDPAToPA, SDPAToPAKVCacheWriteTest, testing::Values(false, true));
+
+// allow_kv_cache_write does not change a model whose layers attend from every row they store.
+TEST(SDPAToPAKVCacheWriteFlagTest, Qwen7bChat_NoWriterWithoutKeyOnlyRows) {
+    auto beam_idx = ov::test::utils::make_param(element::i64, PartialShape{DYN}, "beam_idx");
+    auto position_ids = ov::test::utils::make_param(element::i64, PartialShape{DYN, DYN}, "position_ids");
+    auto attention_mask = ov::test::utils::make_param(element::i64, PartialShape{DYN, DYN}, "attention_mask");
+    auto input_ids = ov::test::utils::make_param(element::i64, PartialShape{DYN, DYN}, "input_ids");
+    ParameterVector params{input_ids, attention_mask, position_ids, beam_idx};
+
+    auto embeddings = Qwen7bChatSDPA::gen_embeddings(input_ids);
+    auto qkv_proj = Qwen7bChatSDPA::gen_qkv_proj(embeddings);
+    auto k_cache = Qwen7bChatSDPA::gen_cache(input_ids, beam_idx, "K_cache");
+    auto v_cache = Qwen7bChatSDPA::gen_cache(input_ids, beam_idx, "V_cache");
+    auto current_seq_len = Qwen7bChatSDPA::gen_current_len(input_ids);
+    auto past_seq_len = Qwen7bChatSDPA::gen_past_len(k_cache);
+    auto total_seq_len = Qwen7bChatSDPA::gen_total_len(current_seq_len, past_seq_len);
+    auto neg_cur_seq_len = Qwen7bChatSDPA::neg_mul(current_seq_len);
+    auto head_size = shared_ptr<Node>();
+    auto rope_emb_sin = Qwen7bChatSDPA::gen_rope_emb_sin(total_seq_len, neg_cur_seq_len, head_size, element::f32);
+    auto rope_emb_cos = Qwen7bChatSDPA::gen_rope_emb_cos(total_seq_len, neg_cur_seq_len, element::f32);
+    auto rope_q = Qwen7bChatSDPA::gen_rope(QKV::Q, qkv_proj, head_size, rope_emb_sin, rope_emb_cos);
+    auto rope_k = Qwen7bChatSDPA::gen_rope(QKV::K, qkv_proj, head_size, rope_emb_sin, rope_emb_cos);
+    auto total_seq_len_2 = Qwen7bChatSDPA::gen_total_seq_len_2(past_seq_len, rope_k);
+    auto past_seq_len_2 = Qwen7bChatSDPA::gen_past_seq_len_2(total_seq_len_2, rope_q);
+    auto Q = Qwen7bChatSDPA::gen_Q(past_seq_len_2, total_seq_len_2, rope_q);
+    auto K = Qwen7bChatSDPA::gen_K(k_cache, rope_k);
+    auto V = Qwen7bChatSDPA::gen_V(v_cache, qkv_proj);
+    auto mask = Qwen7bChatSDPA::gen_attention_mask(Q, attention_mask, total_seq_len_2);
+    auto sdpa = std::make_shared<v13::ScaledDotProductAttention>(Q, K, V, mask, false);
+    auto model = std::make_shared<ov::Model>(ResultVector{std::make_shared<v0::Result>(sdpa)}, params);
+
+    run_sdpa_to_pa(model, true);
+
+    size_t pa_count = 0;
+    for (const auto& op : model->get_ordered_ops()) {
+        EXPECT_FALSE(ov::is_type<ov::op::internal::PagedKVCacheWrite>(op));
+        pa_count += ov::is_type<ov::op::PagedAttentionExtension>(op);
+    }
+    EXPECT_EQ(pa_count, 1u);
+    for (const auto& param : model->get_parameters()) {
+        const auto& name = param->get_friendly_name();
+        EXPECT_EQ(name.find("kv_write_"), std::string::npos) << name;
+        EXPECT_NE(name, "context_kv_position_ids");
     }
 }
 

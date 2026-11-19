@@ -91,6 +91,7 @@ set(GPU_PLUGIN_OPS_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/src/plugin/ops/paged_attention.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/plugin/ops/paged_causal_conv1d.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/plugin/ops/paged_gated_delta_net.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/plugin/ops/paged_kv_cache_write.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/plugin/ops/paged_qsa_indexer.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/plugin/ops/paged_selective_ssm.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/plugin/ops/parameter.cpp

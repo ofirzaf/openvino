@@ -13,6 +13,7 @@
 #include "openvino/op/shape_of.hpp"
 #include "openvino/op/subtract.hpp"
 #include "openvino/op/unsqueeze.hpp"
+#include "openvino/op/variadic_split.hpp"
 #include "openvino/pass/manager.hpp"
 #include "transformations/common_optimizations/fuse_gated_delta_net.hpp"
 #include "transformations/common_optimizations/fuse_ssm.hpp"
@@ -62,7 +63,8 @@ ov::pass::SDPAToPagedAttention::SDPAToPagedAttention(bool use_per_layer_block_in
                                                      bool allow_xattention,
                                                      bool allow_adaptive_rkv,
                                                      bool allow_qq_bias,
-                                                     bool is_draft_model)
+                                                     bool is_draft_model,
+                                                     bool allow_kv_cache_write)
     : m_options{use_per_layer_block_indices_inputs,
                 use_score_outputs,
                 allow_score_aggregation,
@@ -70,7 +72,8 @@ ov::pass::SDPAToPagedAttention::SDPAToPagedAttention(bool use_per_layer_block_in
                 allow_xattention,
                 allow_adaptive_rkv,
                 allow_qq_bias,
-                is_draft_model} {}
+                is_draft_model,
+                allow_kv_cache_write} {}
 
 bool ov::pass::SDPAToPagedAttention::run_on_model(const std::shared_ptr<ov::Model>& model) {
     RUN_ON_MODEL_SCOPE(SDPAToPagedAttention);
@@ -142,8 +145,35 @@ bool ov::pass::SDPAToPagedAttention::run_on_model(const std::shared_ptr<ov::Mode
     const auto position_ids_target_inputs = position_ids->output(0).get_target_inputs();
     auto unsqueezed_position_ids =
         std::make_shared<v0::Unsqueeze>(position_ids, v0::Constant::create(element::i32, Shape{}, {-1}));
-    for (const auto& target : position_ids_target_inputs) {
-        target.replace_source_output(unsqueezed_position_ids);
+    // With allow_kv_cache_write a model may split position_ids into [positions of the rows it only stores in the
+    // KV cache; positions of its query rows] (a DFlash draft: context rows, then block rows). The two groups hold
+    // different numbers of tokens here, so each gets its own input: context_kv_position_ids and position_ids.
+    std::shared_ptr<ov::Node> position_ids_split;
+    if (m_options.allow_kv_cache_write && position_ids_target_inputs.size() == 1) {
+        auto consumer = position_ids_target_inputs.begin()->get_node()->shared_from_this();
+        if (ov::is_type<v1::VariadicSplit>(consumer) && consumer->get_output_size() == 2) {
+            position_ids_split = consumer;
+        }
+    }
+    if (position_ids_split) {
+        // it has consumers right away, so it joins the model now and not with m_params at the end
+        auto stored_position_ids =
+            std::make_shared<v0::Parameter>(position_ids->get_element_type(), PartialShape{-1});
+        stored_position_ids->set_friendly_name("context_kv_position_ids");
+        stored_position_ids->get_output_tensor(0).set_names({"context_kv_position_ids"});
+        model->add_parameters({stored_position_ids});
+        auto unsqueezed_stored_position_ids =
+            std::make_shared<v0::Unsqueeze>(stored_position_ids, v0::Constant::create(element::i32, Shape{}, {-1}));
+        for (const auto& target : position_ids_split->output(0).get_target_inputs()) {
+            target.replace_source_output(unsqueezed_stored_position_ids);
+        }
+        for (const auto& target : position_ids_split->output(1).get_target_inputs()) {
+            target.replace_source_output(unsqueezed_position_ids);
+        }
+    } else {
+        for (const auto& target : position_ids_target_inputs) {
+            target.replace_source_output(unsqueezed_position_ids);
+        }
     }
 
     // Refresh shapes after the input_ids/position_ids changes above; per-pass validation is disabled below.

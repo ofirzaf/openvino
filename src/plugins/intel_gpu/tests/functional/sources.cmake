@@ -346,6 +346,7 @@ set(GPU_FUNCTIONAL_TEST_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/subgraph_tests/dynamic/hybrid.cpp
     ${CMAKE_CURRENT_LIST_DIR}/subgraph_tests/dynamic/kv_cache.cpp
     ${CMAKE_CURRENT_LIST_DIR}/subgraph_tests/dynamic/kv_cache_sdpa.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/subgraph_tests/dynamic/paged_kv_cache_write.cpp
     ${CMAKE_CURRENT_LIST_DIR}/subgraph_tests/dynamic/matmul_weights_decompression.cpp
     ${CMAKE_CURRENT_LIST_DIR}/subgraph_tests/dynamic/moe.cpp
     ${CMAKE_CURRENT_LIST_DIR}/subgraph_tests/dynamic/qdq_stripping.cpp

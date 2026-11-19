@@ -318,6 +318,7 @@ REGISTER_FACTORY(internal, RoPE);
 REGISTER_FACTORY(internal, DynamicQuantize);
 REGISTER_FACTORY(internal, PagedAttentionExtension);
 REGISTER_FACTORY(internal, PA_KV_Reorder);
+REGISTER_FACTORY(internal, PagedKVCacheWrite);
 REGISTER_FACTORY(internal, PagedGatedDeltaNet);
 REGISTER_FACTORY(internal, PagedSelectiveSSM);
 REGISTER_FACTORY(internal, LoraSubgraph);

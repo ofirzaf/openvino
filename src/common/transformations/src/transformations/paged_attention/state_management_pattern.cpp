@@ -24,6 +24,7 @@
 #include "openvino/op/less_eq.hpp"
 #include "openvino/op/multiply.hpp"
 #include "openvino/op/paged_attention.hpp"
+#include "openvino/op/paged_kv_cache_write.hpp"
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/range.hpp"
 #include "openvino/op/reshape.hpp"
@@ -565,6 +566,8 @@ ov::pass::StateManagementPattern::StateManagementPattern(PaParams& pa_params,
             std::make_shared<v1::Reshape>(q_transpose, v0::Constant::create(element::i64, Shape{2}, {0, -1}), true);
 
         ov::Output<ov::Node> k_target_layout, v_target_layout;
+        // Set when the layer appends [key-only rows; query rows] to its cache, see below.
+        ov::Output<ov::Node> k_key_only_layout, v_key_only_layout;
         if (m.get_pattern_map().count(qkv_current_split_node)) {
             // Fast track for merged K/V caches, based on the currently observed models topologies we don't need to
             // change layout and there is no point in the graph where it is in 4D. So `else` branch below is not
@@ -603,6 +606,32 @@ ov::pass::StateManagementPattern::StateManagementPattern(PaParams& pa_params,
             auto real_k = take_4d(k_current, k_current_reshaped, k_current2);
             auto real_v = take_4d(v_current, v_current_reshaped, v_current2);
 
+            // With allow_kv_cache_write the rows a layer appends to its cache may be [key-only rows; query rows],
+            // joined on the sequence axis: rows that have keys and values but no query, then the rows that attend.
+            // A DFlash draft appends its context rows this way, ahead of its block rows. The two groups hold
+            // different numbers of tokens here, so they are taken apart again: PagedKVCacheWrite stores the
+            // key-only rows and PagedAttention runs on the query rows.
+            ov::Output<ov::Node> key_only_k, key_only_v;
+            if (options.allow_kv_cache_write) {
+                auto rows_join = [](const Output<Node>& kv) -> std::shared_ptr<v0::Concat> {
+                    auto concat = ov::as_type_ptr<v0::Concat>(kv.get_node_shared_ptr());
+                    const auto& rank = kv.get_partial_shape().rank();
+                    if (!concat || concat->get_input_size() != 2 || rank.is_dynamic() || rank.get_length() != 4) {
+                        return nullptr;
+                    }
+                    const auto axis = concat->get_axis();
+                    return (axis < 0 ? axis + 4 : axis) == 2 ? concat : nullptr;
+                };
+                auto k_join = rows_join(real_k);
+                auto v_join = rows_join(real_v);
+                if (k_join && v_join) {
+                    key_only_k = k_join->input_value(0);
+                    key_only_v = v_join->input_value(0);
+                    real_k = k_join->input_value(1);
+                    real_v = v_join->input_value(1);
+                }
+            }
+
             std::shared_ptr<Node> k_transpose_order = kv_transpose_order;
             if (pattern_map.count(
                     k_order)) {  // reapply transpose found in the graph by manipulating of indices of our Transpose
@@ -619,6 +648,10 @@ ov::pass::StateManagementPattern::StateManagementPattern(PaParams& pa_params,
                                                                  v0::Constant::create(element::i64, Shape{}, {0}));
             }
             v_target_layout = std::make_shared<v1::Transpose>(real_v, v_transpose_order);
+            if (key_only_k.get_node()) {
+                k_key_only_layout = std::make_shared<v1::Transpose>(key_only_k, k_transpose_order);
+                v_key_only_layout = std::make_shared<v1::Transpose>(key_only_v, v_transpose_order);
+            }
         }
 
         auto k_reshape =
@@ -881,12 +914,46 @@ ov::pass::StateManagementPattern::StateManagementPattern(PaParams& pa_params,
         }
         OPENVINO_ASSERT(pa_arguments.size() == 28);
 
+        std::shared_ptr<ov::op::internal::PagedKVCacheWrite> cache_writer;
+        if (k_key_only_layout.get_node()) {
+            // PagedKVCacheWrite stores the key-only rows, with its own kv_write_* parameters. PagedAttention runs on
+            // the query rows (k_to_pa/v_to_pa) and keeps its parameters, which describe these rows: its past_lens
+            // count the rows written by PagedKVCacheWrite too.
+            OPENVINO_ASSERT(!options.use_per_layer_block_indices_inputs,
+                            "KV cache write does not support per-layer block indices");
+            OPENVINO_ASSERT(kv_params.write_kv_cache, "KV cache write does not support layers that share a KV cache");
+            auto to_pa_layout = [&](const Output<Node>& kv_transposed) -> Output<Node> {
+                return std::make_shared<v1::Reshape>(kv_transposed,
+                                                     v0::Constant::create(element::i64, Shape{2}, {0, -1}),
+                                                     true);
+            };
+            cache_writer = std::make_shared<ov::op::internal::PagedKVCacheWrite>(
+                to_pa_layout(k_key_only_layout),
+                to_pa_layout(v_key_only_layout),
+                k_parameter,
+                v_parameter,
+                pa_params.add("kv_write_past_lens", element::i32, PartialShape{-1}),
+                pa_params.add("kv_write_subsequence_begins", element::i32, PartialShape{-1}),
+                pa_params.add("kv_write_block_indices", element::i32, PartialShape{-1}),
+                pa_params.add("kv_write_block_indices_begins", element::i32, PartialShape{-1}));
+            pa_arguments[3] = cache_writer->output(0);
+            pa_arguments[4] = cache_writer->output(1);
+            // The query rows of a sequence attend to each other in both directions: token type 1 on every row.
+            auto num_rows = std::make_shared<v8::Gather>(std::make_shared<v3::ShapeOf>(q_to_pa, element::i32),
+                                                         v0::Constant::create(element::i64, Shape{1}, {0}),
+                                                         v0::Constant::create(element::i64, Shape{}, {0}));
+            pa_arguments[25] = std::make_shared<v3::Broadcast>(v0::Constant::create(element::i32, Shape{}, {1}), num_rows);
+        }
+
         auto paged_attention =
             std::make_shared<ov::op::PagedAttentionExtension>(pa_arguments, kv_params.write_kv_cache);
         paged_attention->get_rt_info()[NUM_K_HEADS] = num_k_heads;
         paged_attention->get_rt_info()[K_HEAD_SIZE] = k_head_size;
         paged_attention->get_rt_info()[NUM_V_HEADS] = num_v_heads;
         paged_attention->get_rt_info()[V_HEAD_SIZE] = v_head_size;
+        if (cache_writer) {
+            cache_writer->get_rt_info() = paged_attention->get_rt_info();
+        }
 
         // The output shape of PagedAttention will be converted to [batch, 1, head_num, head_size_v], the head_size_v
         // may be different from head_size_q/head_size_k. The head_size_v could be got from the shape of value input

@@ -85,8 +85,12 @@ set(GPU_OCL_V2_IMPL_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/rope_opt.hpp
     ${CMAKE_CURRENT_LIST_DIR}/scatter_nd_update.cpp
     ${CMAKE_CURRENT_LIST_DIR}/scatter_nd_update.hpp
+    ${CMAKE_CURRENT_LIST_DIR}/sdpa/pa_kv_cache_update.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/sdpa/pa_kv_cache_update.hpp
     ${CMAKE_CURRENT_LIST_DIR}/sdpa/paged_attention_opt.cpp
     ${CMAKE_CURRENT_LIST_DIR}/sdpa/paged_attention_opt.hpp
+    ${CMAKE_CURRENT_LIST_DIR}/sdpa/paged_kv_cache_write.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/sdpa/paged_kv_cache_write.hpp
     ${CMAKE_CURRENT_LIST_DIR}/sdpa/sdpa_base.cpp
     ${CMAKE_CURRENT_LIST_DIR}/sdpa/sdpa_base.hpp
     ${CMAKE_CURRENT_LIST_DIR}/sdpa/sdpa_gen_micro.cpp

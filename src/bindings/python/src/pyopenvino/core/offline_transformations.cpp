@@ -151,7 +151,8 @@ void regmodule_offline_transformations(py::module m) {
            bool allow_xattention,
            bool allow_adaptive_rkv,
            bool allow_qq_bias,
-           bool is_draft_model) {
+           bool is_draft_model,
+           bool allow_kv_cache_write) {
             const auto model = Common::utils::convert_to_model(ie_api_model);
             ov::pass::Manager manager;
             manager.register_pass<ov::pass::SDPAToPagedAttention>(use_block_indices_inputs,
@@ -161,7 +162,8 @@ void regmodule_offline_transformations(py::module m) {
                                                                   allow_xattention,
                                                                   allow_adaptive_rkv,
                                                                   allow_qq_bias,
-                                                                  is_draft_model);
+                                                                  is_draft_model,
+                                                                  allow_kv_cache_write);
             manager.run_passes(model);
         },
         py::arg("model"),
@@ -172,7 +174,8 @@ void regmodule_offline_transformations(py::module m) {
         py::arg("allow_xattention") = false,
         py::arg("allow_adaptive_rkv") = false,
         py::arg("allow_qq_bias") = false,
-        py::arg("is_draft_model") = false);
+        py::arg("is_draft_model") = false,
+        py::arg("allow_kv_cache_write") = false);
 
     m_offline_transformations.def(
         "stateful_to_stateless_transformation",
