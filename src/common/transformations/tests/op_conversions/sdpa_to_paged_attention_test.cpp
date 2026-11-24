@@ -1093,13 +1093,15 @@ TEST(SDPAToPAKeepConstPrecisionTest, Qwen7bChat_KVCacheParamsMarkedKeepConstPrec
 namespace {
 // One attention layer of a DFlash-like draft: the context rows (hidden_states) have keys and values only, the block
 // rows (inputs_embeds) attend. [context; block] is appended to the KV state. position_ids = [context; block].
-std::shared_ptr<ov::Model> gen_key_only_rows_model(bool gqa) {
+// With token types, the mask depends on token_type_ids of the block rows.
+std::shared_ptr<ov::Model> gen_key_only_rows_model(bool gqa, bool with_token_types = true) {
     const int q_heads = 4, kv_heads = gqa ? 2 : 4, head_size = 16;
     auto inputs_embeds = ov::test::utils::make_param(element::f32, PartialShape{DYN, DYN, 64}, "inputs_embeds");
     auto hidden_states = ov::test::utils::make_param(element::f32, PartialShape{DYN, DYN, 64}, "hidden_states");
     auto position_ids = ov::test::utils::make_param(element::i64, PartialShape{DYN, DYN}, "position_ids");
     auto attention_mask = ov::test::utils::make_param(element::i64, PartialShape{DYN, DYN}, "attention_mask");
     auto beam_idx = ov::test::utils::make_param(element::i32, PartialShape{DYN}, "beam_idx");
+    auto token_type_ids = ov::test::utils::make_param(element::i64, PartialShape{DYN, DYN}, "token_type_ids");
 
     auto num_rows = [](const std::shared_ptr<Node>& rows) {
         auto shape = makeOP<v3::ShapeOf>({rows}, {{"output_type", "i64"}});
@@ -1138,11 +1140,16 @@ std::shared_ptr<ov::Model> gen_key_only_rows_model(bool gqa) {
     auto q = heads_of(inputs_embeds, q_heads, positions->output(1));
     auto k = keys_or_values("K_cache");
     auto v = keys_or_values("V_cache");
-    auto mask = makeConst(element::f32, {1, 1, 1, 1}, {0.f});
+    ParameterVector params{inputs_embeds, hidden_states, position_ids, attention_mask, beam_idx};
+    std::shared_ptr<Node> mask = makeConst(element::f32, {1, 1, 1, 1}, {0.f});
+    if (with_token_types) {
+        // [B, block] -> [B, 1, block, 1], 0 for every block row: a stand-in for the mask built from token types
+        auto types = makeOP<v0::Unsqueeze>({makeOP<v0::Convert>({token_type_ids}, {dest_type_f32}), {1, 3}});
+        mask = makeOP<v1::Multiply>({types, 0.f}, {numpy_broadcast});
+        params.push_back(token_type_ids);
+    }
     auto sdpa = std::make_shared<v13::ScaledDotProductAttention>(q, k, v, mask, false);
-    return std::make_shared<ov::Model>(ResultVector{std::make_shared<v0::Result>(sdpa)},
-                                       sinks,
-                                       ParameterVector{inputs_embeds, hidden_states, position_ids, attention_mask, beam_idx});
+    return std::make_shared<ov::Model>(ResultVector{std::make_shared<v0::Result>(sdpa)}, sinks, params);
 }
 
 // Friendly names of the parameters a node depends on
@@ -1226,10 +1233,9 @@ TEST_P(SDPAToPAKVCacheWriteTest, WriterStoresContextRows_PagedAttentionRunsOnBlo
     }
     // PagedAttention stores its block rows, as for any other model.
     EXPECT_TRUE(pa->get_write_kv_cache());
-    // Block rows attend to each other in both directions: token type 1 on every row.
-    EXPECT_EQ(source_parameters(pa->input_value(25)), block_sources);
+    // Block rows attend to each other in both directions: PA gets the model's token types of the block rows.
+    EXPECT_EQ(source_parameters(pa->input_value(25)), std::set<std::string>{"token_type_ids"});
     EXPECT_EQ(pa->get_input_element_type(25), element::i32);
-    EXPECT_EQ(pa->get_input_partial_shape(25), PartialShape{DYN});
 
     // PA keeps its parameters; the writer gets the kv_write_* ones.
     const std::vector<std::pair<size_t, std::string>> pa_params{{5, "past_lens"},
@@ -1249,6 +1255,26 @@ TEST_P(SDPAToPAKVCacheWriteTest, WriterStoresContextRows_PagedAttentionRunsOnBlo
 }
 
 INSTANTIATE_TEST_SUITE_P(SDPAToPA, SDPAToPAKVCacheWriteTest, testing::Values(false, true));
+
+// Without token types the writer is inserted as well, and PA gets no token types, as for any causal model.
+TEST(SDPAToPAKVCacheWriteFlagTest, KeyOnlyRowsWithoutTokenTypes_CausalPagedAttention) {
+    auto model = gen_key_only_rows_model(true, false);
+    run_sdpa_to_pa(model, true);
+
+    size_t writer_count = 0;
+    std::shared_ptr<ov::op::PagedAttentionExtension> pa;
+    for (const auto& op : model->get_ordered_ops()) {
+        writer_count += ov::is_type<ov::op::internal::PagedKVCacheWrite>(op);
+        if (auto p = ov::as_type_ptr<ov::op::PagedAttentionExtension>(op)) {
+            pa = p;
+        }
+    }
+    EXPECT_EQ(writer_count, 1u);
+    ASSERT_TRUE(pa);
+    auto token_types = ov::as_type_ptr<v0::Constant>(pa->get_input_node_shared_ptr(25));
+    ASSERT_TRUE(token_types);
+    EXPECT_EQ(ov::shape_size(token_types->get_shape()), 0u);
+}
 
 // allow_kv_cache_write does not change a model whose layers attend from every row they store.
 TEST(SDPAToPAKVCacheWriteFlagTest, Qwen7bChat_NoWriterWithoutKeyOnlyRows) {

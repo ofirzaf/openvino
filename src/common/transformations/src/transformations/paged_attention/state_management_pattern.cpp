@@ -938,11 +938,6 @@ ov::pass::StateManagementPattern::StateManagementPattern(PaParams& pa_params,
                 pa_params.add("kv_write_block_indices_begins", element::i32, PartialShape{-1}));
             pa_arguments[3] = cache_writer->output(0);
             pa_arguments[4] = cache_writer->output(1);
-            // The query rows of a sequence attend to each other in both directions: token type 1 on every row.
-            auto num_rows = std::make_shared<v8::Gather>(std::make_shared<v3::ShapeOf>(q_to_pa, element::i32),
-                                                         v0::Constant::create(element::i64, Shape{1}, {0}),
-                                                         v0::Constant::create(element::i64, Shape{}, {0}));
-            pa_arguments[25] = std::make_shared<v3::Broadcast>(v0::Constant::create(element::i32, Shape{}, {1}), num_rows);
         }
 
         auto paged_attention =
