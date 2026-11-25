@@ -185,12 +185,14 @@ MOE3GEMMPatternNodes build_3gemm_pattern(const std::vector<ov::element::Type>& s
 
     // Softcapped SwiGLU: the gate GEMM feeds both the softcap and the Sigmoid.
     // The values of the softcap constants are checked when the block is fused into the MOE op.
+    // The inner scaling is optional: when this pass runs after MatMulMultiplyFusion (CPU), the 1 / c of a GEMM with
+    // a single consumer is already folded into its weights.
     const auto softcap = [](const std::shared_ptr<ov::Node>& input,
                             std::shared_ptr<ov::Node>& scaled,
                             std::shared_ptr<ov::Node>& tanh,
                             std::shared_ptr<ov::Node>& cap) {
-        scaled =
-            pattern::wrap_type<v1::Divide, v1::Multiply>({input, pattern::any_input()}, pattern::consumers_count(1));
+        scaled = pattern::optional<v1::Divide, v1::Multiply>({input, pattern::any_input()},
+                                                             pattern::consumers_count(1));
         tanh = pattern::wrap_type<v0::Tanh>({scaled}, pattern::consumers_count(1));
         cap = pattern::wrap_type<v1::Multiply>({tanh, pattern::any_input()}, pattern::consumers_count(1));
     };
@@ -387,16 +389,20 @@ ConvertTiledMoeBlockTo3GatherMatmuls::ConvertTiledMoeBlockTo3GatherMatmuls(
         ov::replace_node_update_name(up_mm_node, up_gathered_mm);
 
         if (is_softcapped) {
-            validate_nodes(pm,
-                           {p.sc_gate_scaled,
-                            p.sc_gate_tanh,
-                            p.sc_gate_cap,
-                            p.sc_sigmoid,
-                            p.sc_gate_act,
-                            p.sc_up_scaled,
-                            p.sc_up_tanh,
-                            p.sc_up_cap,
-                            p.sc_swiglu});
+            // The inner scaling nodes are optional in the pattern
+            for (const auto& node : {p.sc_gate_scaled,
+                                     p.sc_gate_tanh,
+                                     p.sc_gate_cap,
+                                     p.sc_sigmoid,
+                                     p.sc_gate_act,
+                                     p.sc_up_scaled,
+                                     p.sc_up_tanh,
+                                     p.sc_up_cap,
+                                     p.sc_swiglu}) {
+                if (pm.count(node)) {
+                    validate_nodes(pm, {node});
+                }
+            }
         } else {
             validate_nodes(pm, {p.swish, p.plain_swiglu});
         }

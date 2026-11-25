@@ -61,13 +61,19 @@ inline std::ostream& operator<<(std::ostream& os, const MoEType& type) {
     }
 }
 
-enum class GateActivationType { SWISH, GELU, SOFTCAPPED_SWIGLU };
+// SOFTCAPPED_SWIGLU_FOLDED_UP_SCALE: the 1 / c of the up softcap is already folded into the up MatMul weights
+enum class GateActivationType { SWISH, GELU, SOFTCAPPED_SWIGLU, SOFTCAPPED_SWIGLU_FOLDED_UP_SCALE };
+
+inline bool is_softcapped_swiglu(GateActivationType type) {
+    return type == GateActivationType::SOFTCAPPED_SWIGLU ||
+           type == GateActivationType::SOFTCAPPED_SWIGLU_FOLDED_UP_SCALE;
+}
 
 // softcap(x, c) = c * Tanh(x / c)
-inline std::shared_ptr<ov::Node> make_softcap(const ov::Output<ov::Node>& x, float cap) {
+inline std::shared_ptr<ov::Node> make_softcap(const ov::Output<ov::Node>& x, float cap, bool inner_scale = true) {
     const auto cap_const = ov::op::v0::Constant::create(x.get_element_type(), ov::Shape{}, {cap});
-    const auto tanh = std::make_shared<ov::op::v0::Tanh>(std::make_shared<ov::op::v1::Divide>(x, cap_const));
-    return std::make_shared<ov::op::v1::Multiply>(tanh, cap_const);
+    const auto scaled = inner_scale ? std::make_shared<ov::op::v1::Divide>(x, cap_const)->output(0) : x;
+    return std::make_shared<ov::op::v1::Multiply>(std::make_shared<ov::op::v0::Tanh>(scaled), cap_const);
 }
 
 // Gate factor of the softcapped SwiGLU: softcap(gate) * Sigmoid(gate). The up projection is softcapped as well.
@@ -561,7 +567,7 @@ inline std::shared_ptr<ov::Model> initMoE3GeMMSubgraph(bool use_scatter_v12,
 
     // Gate activation: Swish (SwiGLU), Gelu (GeGLU) or softcapped SwiGLU
     std::shared_ptr<ov::Node> gate_act;
-    if (gate_activation == GateActivationType::SOFTCAPPED_SWIGLU) {
+    if (is_softcapped_swiglu(gate_activation)) {
         gate_act = make_softcapped_gate(gate_matmul);
     } else if (gate_activation == GateActivationType::GELU) {
         gate_act = std::make_shared<ov::op::v7::Gelu>(gate_matmul);
@@ -577,10 +583,11 @@ inline std::shared_ptr<ov::Model> initMoE3GeMMSubgraph(bool use_scatter_v12,
 
     up_matmul->set_friendly_name("UpMatMul");
 
-    const bool is_softcapped = gate_activation == GateActivationType::SOFTCAPPED_SWIGLU;
+    const bool up_inner_scale = gate_activation == GateActivationType::SOFTCAPPED_SWIGLU;
     auto swiglu = std::make_shared<ov::op::v1::Multiply>(
         gate_act,
-        is_softcapped ? make_softcap(up_matmul, 25.0f)->output(0) : up_matmul->output(0));
+        is_softcapped_swiglu(gate_activation) ? make_softcap(up_matmul, 25.0f, up_inner_scale)->output(0)
+                                              : up_matmul->output(0));
 
     auto down_weights = build_matmul_weights(ov::Shape{number_of_experts, intermediate_size, hidden_size},
                                              weights_precision,
@@ -830,7 +837,7 @@ inline std::shared_ptr<ov::Model> initMoE3GeMMSubgraphRef(
 
     // Gate activation: Swish (SwiGLU), Gelu (GeGLU) or softcapped SwiGLU
     std::shared_ptr<ov::Node> gate_act;
-    if (gate_activation == GateActivationType::SOFTCAPPED_SWIGLU) {
+    if (is_softcapped_swiglu(gate_activation)) {
         gate_act = make_softcapped_gate(gate_gathered_mm);
     } else if (gate_activation == GateActivationType::GELU) {
         gate_act = std::make_shared<ov::op::v7::Gelu>(gate_gathered_mm);
@@ -845,10 +852,11 @@ inline std::shared_ptr<ov::Model> initMoE3GeMMSubgraphRef(
 
     auto up_gathered_mm = std::make_shared<GatherMatmul>(unsqueeze_experts, up_weights, router_topk_indices);
 
-    const bool is_softcapped = gate_activation == GateActivationType::SOFTCAPPED_SWIGLU;
+    const bool up_inner_scale = gate_activation == GateActivationType::SOFTCAPPED_SWIGLU;
     auto swiglu = std::make_shared<ov::op::v1::Multiply>(
         gate_act,
-        is_softcapped ? make_softcap(up_gathered_mm, 25.0f)->output(0) : up_gathered_mm->output(0));
+        is_softcapped_swiglu(gate_activation) ? make_softcap(up_gathered_mm, 25.0f, up_inner_scale)->output(0)
+                                              : up_gathered_mm->output(0));
 
     auto down_weights = build_matmul_weights(ov::Shape{number_of_experts, intermediate_size, hidden_size},
                                              weights_precision,
@@ -1104,6 +1112,19 @@ TEST_F(TransformationTestsF, ConvertTiledMoeBlockToGatherMatmuls_3gemm_softcappe
     manager.register_pass<ov::pass::ConvertTiledMoeBlockToGatherMatmuls>();
     model_ref =
         initMoE3GeMMSubgraphRef(true, true, true, true, GateActivationType::SOFTCAPPED_SWIGLU, false, true, true);
+}
+
+// After MatMulMultiplyFusion (CPU pipeline) the up MatMul has no scaling node before the Tanh
+TEST_F(TransformationTestsF, ConvertTiledMoeBlockToGatherMatmuls_3gemm_softcapped_swiglu_folded_up_scale) {
+    model = initMoE3GeMMSubgraph(false,
+                                 false,
+                                 false,
+                                 true,
+                                 AdditionalConsumersMode::NO,
+                                 GateActivationType::SOFTCAPPED_SWIGLU_FOLDED_UP_SCALE);
+    manager.register_pass<ov::pass::ConvertTiledMoeBlockToGatherMatmuls>();
+    model_ref =
+        initMoE3GeMMSubgraphRef(false, false, false, true, GateActivationType::SOFTCAPPED_SWIGLU_FOLDED_UP_SCALE);
 }
 
 // A third consumer of the gate MatMul, or a second consumer of the gate factor: not converted
