@@ -240,7 +240,7 @@ KERNEL(moe_int3_gemv)(
         const float out = sub_group_reduce_add(acc[0][j]) * routing_weight;
 #else
         const float gate = sub_group_reduce_add(acc[0][j]);
-        const float out = MOE_GATE_ACT(gate) * sub_group_reduce_add(acc[1][j]);
+        const float out = MOE_GATE_ACT(gate) * MOE_UP_ACT(sub_group_reduce_add(acc[1][j]));
 #endif
         if (lane == 0)
             y[(size_t)pair * N_SIZE + n0 + j] = (half)out;

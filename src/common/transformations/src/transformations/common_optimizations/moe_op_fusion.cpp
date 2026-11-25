@@ -4,24 +4,30 @@
 
 #include "transformations/common_optimizations/moe_op_fusion.hpp"
 
+#include <cmath>
 #include <limits>
+#include <optional>
 
 #include "itt.hpp"
 #include "openvino/core/graph_util.hpp"
 #include "openvino/core/rt_info.hpp"
 #include "openvino/core/type/element_type.hpp"
+#include "openvino/core/validation_util.hpp"
 #include "openvino/op/add.hpp"
 #include "openvino/op/clamp.hpp"
 #include "openvino/op/constant.hpp"
 #include "openvino/op/convert.hpp"
+#include "openvino/op/divide.hpp"
 #include "openvino/op/gelu.hpp"
 #include "openvino/op/minimum.hpp"
 #include "openvino/op/moe.hpp"
 #include "openvino/op/multiply.hpp"
 #include "openvino/op/reduce_sum.hpp"
 #include "openvino/op/reshape.hpp"
+#include "openvino/op/sigmoid.hpp"
 #include "openvino/op/slice.hpp"
 #include "openvino/op/swish.hpp"
+#include "openvino/op/tanh.hpp"
 #include "openvino/op/transpose.hpp"
 #include "openvino/op/unsqueeze.hpp"
 #include "openvino/pass/pattern/matcher.hpp"
@@ -51,6 +57,54 @@ static size_t weight_logical_K(const ov::Shape& shape) {
     OPENVINO_ASSERT(shape.size() == 3 || shape.size() == 4, "MOE weight must be rank 3 or 4, got rank ", shape.size());
     return shape.size() == 4 ? shape[2] * shape[3] : shape[2];
 }
+
+namespace {
+// softcap(x, c) = Multiply(Tanh(Divide(x, c)), c), or with Multiply(x, 1 / c) in place of the Divide
+struct SoftcapPattern {
+    std::shared_ptr<ov::Node> scale_m, scaled_m, tanh_m, cap_const_m, cap;
+
+    explicit SoftcapPattern(const std::shared_ptr<ov::Node>& input_m) {
+        scale_m = pattern::any_input();
+        scaled_m = pattern::wrap_type<v1::Divide, v1::Multiply>({input_m, scale_m});
+        tanh_m = pattern::wrap_type<v0::Tanh>({scaled_m});
+        cap_const_m = pattern::any_input();
+        cap = pattern::wrap_type<v1::Multiply>({tanh_m, cap_const_m});
+    }
+
+    // Returns c, or nullopt when the matched nodes are not softcap(expected_input, c)
+    std::optional<float> get_softcap(const pattern::PatternValueMap& pm,
+                                     const ov::Output<ov::Node>& expected_input) const {
+        const auto scaled = pm.at(scaled_m).get_node_shared_ptr();
+        const auto scale_out = pm.at(scale_m);
+        // Multiply is commutative: find which input of the matched node is the scale
+        const size_t scale_idx = scaled->input_value(1) == scale_out ? 1 : 0;
+        if (ov::is_type<v1::Divide>(scaled) && scale_idx != 1) {
+            return std::nullopt;
+        }
+        if (scaled->input_value(1 - scale_idx) != expected_input) {
+            return std::nullopt;
+        }
+        const auto get_scalar = [](const ov::Output<ov::Node>& out) -> std::optional<float> {
+            const auto constant = ov::util::get_constant_from_source(out);
+            if (!constant || ov::shape_size(constant->get_shape()) != 1) {
+                return std::nullopt;
+            }
+            return constant->cast_vector<float>()[0];
+        };
+        const auto scale = get_scalar(scale_out);
+        const auto cap_value = get_scalar(pm.at(cap_const_m));
+        if (!scale || !cap_value || !(*cap_value > 0.0f)) {
+            return std::nullopt;
+        }
+        // Relative tolerance covers constants stored as f16
+        const float inv_cap = ov::is_type<v1::Divide>(scaled) ? 1.0f / *scale : *scale;
+        if (std::abs(inv_cap * *cap_value - 1.0f) > 1e-3f) {
+            return std::nullopt;
+        }
+        return cap_value;
+    }
+};
+}  // namespace
 
 Convert3GatherMatmulMoeBlockToMoeOp::Convert3GatherMatmulMoeBlockToMoeOp() {
     MATCHER_SCOPE(Convert3GatherMatmulMoeBlockToMoeOp);
@@ -83,7 +137,16 @@ Convert3GatherMatmulMoeBlockToMoeOp::Convert3GatherMatmulMoeBlockToMoeOp() {
         {unsqueeze_m, up_w_m, topk_indices_m, pattern::any_input(), up_scale_m, up_zp_m});
     auto bgm_up_m = bgm_up_4_m | bgm_up_6_m;
 
-    auto swiglu_m = pattern::wrap_type<v1::Multiply>({swish_m, bgm_up_m});
+    auto plain_swiglu_m = pattern::wrap_type<v1::Multiply>({swish_m, bgm_up_m});
+
+    // Softcapped SwiGLU: softcap(gate) * Sigmoid(gate) * softcap(up)
+    SoftcapPattern gate_softcap_m(bgm_gate_m);
+    auto sc_sigmoid_m = pattern::wrap_type<v0::Sigmoid>({bgm_gate_m});
+    auto sc_gate_act_m = pattern::wrap_type<v1::Multiply>({gate_softcap_m.cap, sc_sigmoid_m});
+    SoftcapPattern up_softcap_m(bgm_up_m);
+    auto sc_swiglu_m = pattern::wrap_type<v1::Multiply>({sc_gate_act_m, up_softcap_m.cap});
+
+    auto swiglu_m = plain_swiglu_m | sc_swiglu_m;
 
     auto down_w_m = pattern::any_input();
     auto bgm_down_4_m = pattern::wrap_type<GatherMatmul>({swiglu_m, down_w_m, topk_indices_m, pattern::any_input()});
@@ -124,25 +187,40 @@ Convert3GatherMatmulMoeBlockToMoeOp::Convert3GatherMatmulMoeBlockToMoeOp() {
 
         // Extract expert_beta and detect activation type from the matched gate activation node.
         float expert_beta = 1.0f;
+        float gate_softcap = 0.0f;
+        float up_softcap = 0.0f;
         ov::op::internal::MOE::Activation_type activation_type = ov::op::internal::MOE::Activation_type::SWIGLU;
-        auto activation_node = pm.at(swish_m).get_node_shared_ptr();
 
-        if (auto swish_op = ov::as_type_ptr<v4::Swish>(activation_node)) {
-            if (swish_op->get_input_size() > 1) {
-                if (auto beta_const = ov::as_type_ptr<v0::Constant>(swish_op->get_input_node_shared_ptr(1))) {
-                    expert_beta = beta_const->cast_vector<float>()[0];
-                }
-            }
-        } else if (auto gelu_op = ov::as_type_ptr<v7::Gelu>(activation_node)) {
-            if (gelu_op->get_approximation_mode() == ov::op::GeluApproximationMode::TANH) {
-                activation_type = ov::op::internal::MOE::Activation_type::GEGLU_TANH;
-            } else if (gelu_op->get_approximation_mode() == ov::op::GeluApproximationMode::ERF) {
-                activation_type = ov::op::internal::MOE::Activation_type::GEGLU_ERF;
-            } else {
+        if (pm.count(sc_swiglu_m)) {
+            // The Sigmoid and the gate softcap must read the same gate GEMM
+            const auto& gate = pm.at(bgm_gate_m);
+            const auto gate_cap = gate_softcap_m.get_softcap(pm, gate);
+            const auto up_cap = up_softcap_m.get_softcap(pm, pm.at(bgm_up_m));
+            if (pm.at(sc_sigmoid_m).get_node_shared_ptr()->input_value(0) != gate || !gate_cap || !up_cap) {
                 return false;
             }
+            gate_softcap = *gate_cap;
+            up_softcap = *up_cap;
+            activation_type = ov::op::internal::MOE::Activation_type::SWIGLU_SOFTCAP;
         } else {
-            OPENVINO_THROW("Unexpected node type matched for gate activation: ", activation_node);
+            auto activation_node = pm.at(swish_m).get_node_shared_ptr();
+            if (auto swish_op = ov::as_type_ptr<v4::Swish>(activation_node)) {
+                if (swish_op->get_input_size() > 1) {
+                    if (auto beta_const = ov::as_type_ptr<v0::Constant>(swish_op->get_input_node_shared_ptr(1))) {
+                        expert_beta = beta_const->cast_vector<float>()[0];
+                    }
+                }
+            } else if (auto gelu_op = ov::as_type_ptr<v7::Gelu>(activation_node)) {
+                if (gelu_op->get_approximation_mode() == ov::op::GeluApproximationMode::TANH) {
+                    activation_type = ov::op::internal::MOE::Activation_type::GEGLU_TANH;
+                } else if (gelu_op->get_approximation_mode() == ov::op::GeluApproximationMode::ERF) {
+                    activation_type = ov::op::internal::MOE::Activation_type::GEGLU_ERF;
+                } else {
+                    return false;
+                }
+            } else {
+                OPENVINO_THROW("Unexpected node type matched for gate activation: ", activation_node);
+            }
         }
 
         std::shared_ptr<ov::Node> moe_node;
@@ -215,7 +293,13 @@ Convert3GatherMatmulMoeBlockToMoeOp::Convert3GatherMatmulMoeBlockToMoeOp() {
             const bool has_zp = pm.at(gate_zp_m).get_element_type() != ov::element::dynamic;
 
             MOECompressed::Config compressed_config{
-                {ov::op::internal::MOE::Expert_type::GEMM3_SWIGLU, 0.0f, expert_beta, 0, activation_type},
+                {ov::op::internal::MOE::Expert_type::GEMM3_SWIGLU,
+                 0.0f,
+                 expert_beta,
+                 0,
+                 activation_type,
+                 gate_softcap,
+                 up_softcap},
                 gate_K,
                 weight_shape[1],
                 weight_shape[0],
@@ -244,7 +328,9 @@ Convert3GatherMatmulMoeBlockToMoeOp::Convert3GatherMatmulMoeBlockToMoeOp() {
                                                  0.0f,
                                                  expert_beta,
                                                  0,
-                                                 activation_type};
+                                                 activation_type,
+                                                 gate_softcap,
+                                                 up_softcap};
             // Plain MOE with 6 inputs
             ov::OutputVector moe_inputs = {hidden_states, routing, topk_indices, gate_w, up_w, down_w};
 

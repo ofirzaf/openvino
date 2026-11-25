@@ -67,8 +67,17 @@ using cldnn::onednn::convert_data_type;
 using cldnn::onednn::onednn_linear;
 using cldnn::onednn::onednn_matmul;
 
+// The softcapped SwiGLU reads the gate twice (softcap(gate) * sigmoid(gate)) and transforms `up`, so it is not
+// a chain of OneDNN post-ops: the paths below apply it with the prefill_swiglu OCL kernel instead.
+inline bool has_onednn_gate_post_ops(ov::op::internal::MOE::Activation_type act) {
+    return act != ov::op::internal::MOE::Activation_type::SWIGLU_SOFTCAP;
+}
+
 inline dnnl::algorithm moe_activation_to_dnnl_algo(ov::op::internal::MOE::Activation_type act) {
     switch (act) {
+    case ov::op::internal::MOE::Activation_type::SWIGLU_SOFTCAP:
+        OPENVINO_THROW("MoE 3GEMM: the softcapped SwiGLU gate has no OneDNN post-op implementation "
+                       "(per-expert OneDNN prefill, shared experts)");
     case ov::op::internal::MOE::Activation_type::GEGLU_TANH:
         return dnnl::algorithm::eltwise_gelu_tanh;
     case ov::op::internal::MOE::Activation_type::GEGLU_ERF:
@@ -294,11 +303,7 @@ protected:
         jit.make("SUBGROUP_SIZE", info.arch >= gpu_arch::xe2 ? 32 : 16);
         jit.make("INTERMEDIA_SIZE", desc->_config.inter_size);
         jit.make("MOE_DTYPE", "half");
-        if (desc->_config.activation_type == ov::op::internal::MOE::Activation_type::GEGLU_TANH) {
-            jit.make("GATE_ACT_GELU_TANH", 1);
-        } else if (desc->_config.activation_type == ov::op::internal::MOE::Activation_type::GEGLU_ERF) {
-            jit.make("GATE_ACT_GELU_ERF", 1);
-        }
+        add_moe_gate_activation_jit_constants(jit, desc->_config);
         if (m_use_grouped_gemm) {
             jit.make("ONEDNN_GROUPED_GEMM_USED", 1);
         }
@@ -565,11 +570,7 @@ protected:
         auto desc = params.typed_desc<moe_3gemm_fused_compressed>();
         add_common_consts(params, jit);
         jit.make("GATE_UP_ENABLE", 1);
-        if (desc->_config.activation_type == ov::op::internal::MOE::Activation_type::GEGLU_TANH) {
-            jit.make("GATE_ACT_GELU_TANH", 1);
-        } else if (desc->_config.activation_type == ov::op::internal::MOE::Activation_type::GEGLU_ERF) {
-            jit.make("GATE_ACT_GELU_ERF", 1);
-        }
+        add_moe_gate_activation_jit_constants(jit, desc->_config);
         if (!_disable_shared_experts && desc->_config.num_shared_expert > 0 &&
             params.input_layouts.size() > static_cast<size_t>(MOE3GemmInputIndex::SHARED_GATE_WEIGHT)) {
             jit.make("SHARED_EXPERT_ENABLE", 1);
@@ -1218,6 +1219,11 @@ public:
         // The micro-GEMM reads the scales and zero points of every expert, not of the expert slots
         if (prefill_impl == MoeGemmImpl::micro_gemm && node.as<moe_3gemm_fused_compressed>().get_primitive()->_otd.lru_expert_num > 0) {
             prefill_impl = MoeGemmImpl::per_expert_onednn;
+        }
+        // The per-expert OneDNN loop fuses the gate activation as OneDNN post-ops
+        if (prefill_impl == MoeGemmImpl::per_expert_onednn &&
+            !has_onednn_gate_post_ops(node.as<moe_3gemm_fused_compressed>().get_primitive()->_config.activation_type)) {
+            prefill_impl = MoeGemmImpl::grouped_gemm;
         }
 
         GPU_DEBUG_TRACE_DETAIL << "[DEBUG] moe_3gemm_swiglu_opt_impl(): prefill_impl=" << static_cast<int>(prefill_impl)
@@ -2616,7 +2622,11 @@ public:
         // Gate GEMM with fused eltwise(swish/gelu) + binary_mul(up_output) post-ops.
         // This eliminates the separate grouped_gemm_prefill_swiglu OCL kernel.
         // Execution order: up GEMM first, then gate GEMM with post-ops consuming up output.
-        {
+        if (!has_onednn_gate_post_ops(_activation_type)) {
+            // Plain gate GEMM: the grouped_gemm_prefill_swiglu OCL kernel applies the activation
+            gk->gate_pd = make_pd(K_gu, N_gu, _gate_up_group_size, gw_dt, 0, dnnl::post_ops());
+            gk->gate_prim = dnnl::matmul(gk->gate_pd);
+        } else {
             // Post-ops: eltwise(activation) + binary_mul(up_output as grouped tensor)
             dnnl::post_ops gate_po;
             auto activation_algo = moe_activation_to_dnnl_algo(_activation_type);
@@ -2999,9 +3009,31 @@ public:
         // up GEMM: [total, hidden] * W_up[E,hidden,inter] -> [total, inter]
         exec_gemm(1, gk.up_prim, gk.up_pd, scratch.x, scratch.up, gk.up_scale_md, gk.up_zp_md, nullptr);
 
-        // gate GEMM with fused post-ops: gate_output = activation(X * W_gate) * up_output
-        // Result written to scratch.gate, ready for down GEMM.
-        exec_gemm(0, gk.gate_prim, gk.gate_pd, scratch.x, scratch.gate, gk.gate_scale_md, gk.gate_zp_md, scratch.up);
+        if (gk.gate_has_post_ops) {
+            // gate GEMM with fused post-ops: gate_output = activation(X * W_gate) * up_output
+            // Result written to scratch.gate, ready for down GEMM.
+            exec_gemm(0, gk.gate_prim, gk.gate_pd, scratch.x, scratch.gate, gk.gate_scale_md, gk.gate_zp_md, scratch.up);
+        } else {
+            // gate GEMM: [total, hidden] * W_gate[E,hidden,inter] -> [total, inter]
+            exec_gemm(0, gk.gate_prim, gk.gate_pd, scratch.x, scratch.gate, gk.gate_scale_md, gk.gate_zp_md, nullptr);
+
+            // activation(gate) * up -> scratch.gate (OCL prefill_swiglu kernel, compiled with ONEDNN_GROUPED_GEMM_USED).
+            // The GEMMs are submitted to the same in-order queue as the OCL kernels (OTD: explicit sync).
+            on_after_grouped_gemm(stream);
+            const size_t subgroup_size = instance.get_impl_params()->get_device_info().arch >= gpu_arch::xe2 ? 32 : 16;
+            OPENVINO_ASSERT(static_cast<size_t>(_intermediate_size) % subgroup_size == 0,
+                            "MoE prefill_swiglu: intermediate_size=",
+                            _intermediate_size,
+                            " is not a multiple of SUBGROUP_SIZE=",
+                            subgroup_size);
+            ret_event = execute_stage({ret_event},
+                                      instance,
+                                      *grouped_gemm_prefill_swiglu,
+                                      {scratch.up, scratch.gate},
+                                      {scratch.gate},
+                                      {static_cast<size_t>(_intermediate_size), static_cast<size_t>(total_gathered_tokens), 1},
+                                      {subgroup_size, 1, 1});
+        }
 
         // down GEMM: [total, inter] * W_down[E,inter,hidden] -> [total, hidden]
         exec_gemm(2, gk.down_prim, gk.down_pd, scratch.gate, scratch.y, gk.down_scale_md, gk.down_zp_md, nullptr);

@@ -12,6 +12,7 @@
 #include "openvino/op/add.hpp"
 #include "openvino/op/clamp.hpp"
 #include "openvino/op/constant.hpp"
+#include "openvino/op/divide.hpp"
 #include "openvino/op/gelu.hpp"
 #include "openvino/op/matmul.hpp"
 #include "openvino/op/minimum.hpp"
@@ -19,9 +20,11 @@
 #include "openvino/op/reduce_sum.hpp"
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/scatter_elements_update.hpp"
+#include "openvino/op/sigmoid.hpp"
 #include "openvino/op/slice.hpp"
 #include "openvino/op/squeeze.hpp"
 #include "openvino/op/swish.hpp"
+#include "openvino/op/tanh.hpp"
 #include "openvino/op/tile.hpp"
 #include "openvino/op/transpose.hpp"
 #include "openvino/op/unsqueeze.hpp"
@@ -148,7 +151,10 @@ MOE2GEMMPatternNodes build_2gemm_pattern(const std::vector<ov::element::Type>& s
 
 struct MOE3GEMMPatternNodes {
     std::shared_ptr<ov::Node> experts_input, tile, after_tile_reshape;
-    std::shared_ptr<ov::Node> gate_matmul, swish, up_matmul, swiglu;
+    std::shared_ptr<ov::Node> gate_matmul, swish, up_matmul, plain_swiglu, swiglu;
+    // Softcapped SwiGLU: softcap(gate) * Sigmoid(gate) * softcap(up), softcap(x) = c * Tanh(x / c)
+    std::shared_ptr<ov::Node> sc_gate_matmul, sc_gate_scaled, sc_gate_tanh, sc_gate_cap, sc_sigmoid, sc_gate_act;
+    std::shared_ptr<ov::Node> sc_up_scaled, sc_up_tanh, sc_up_cap, sc_swiglu;
     std::shared_ptr<ov::Node> down_matmul;
     std::shared_ptr<ov::Node> end_reshape_target_shape, end_reshape;
     std::shared_ptr<ov::Node> router_topk_indices, chosen_experts, scatter_elements_update;
@@ -175,7 +181,29 @@ MOE3GEMMPatternNodes build_3gemm_pattern(const std::vector<ov::element::Type>& s
         {p.after_tile_reshape, make_expert_weight_pattern(supported_weights_types)},
         pattern::consumers_count(1) && pattern::attrs_match({{"transpose_a", false}, {"transpose_b", true}}));
     // Join: Multiply (SwiGLU)
-    p.swiglu = pattern::wrap_type<v1::Multiply>({p.swish, p.up_matmul}, pattern::consumers_count(1));
+    p.plain_swiglu = pattern::wrap_type<v1::Multiply>({p.swish, p.up_matmul}, pattern::consumers_count(1));
+
+    // Softcapped SwiGLU: the gate GEMM feeds both the softcap and the Sigmoid.
+    // The values of the softcap constants are checked when the block is fused into the MOE op.
+    const auto softcap = [](const std::shared_ptr<ov::Node>& input,
+                            std::shared_ptr<ov::Node>& scaled,
+                            std::shared_ptr<ov::Node>& tanh,
+                            std::shared_ptr<ov::Node>& cap) {
+        scaled =
+            pattern::wrap_type<v1::Divide, v1::Multiply>({input, pattern::any_input()}, pattern::consumers_count(1));
+        tanh = pattern::wrap_type<v0::Tanh>({scaled}, pattern::consumers_count(1));
+        cap = pattern::wrap_type<v1::Multiply>({tanh, pattern::any_input()}, pattern::consumers_count(1));
+    };
+    p.sc_gate_matmul = pattern::wrap_type<v0::MatMul>(
+        {p.after_tile_reshape, make_expert_weight_pattern(supported_weights_types)},
+        pattern::consumers_count(2) && pattern::attrs_match({{"transpose_a", false}, {"transpose_b", true}}));
+    softcap(p.sc_gate_matmul, p.sc_gate_scaled, p.sc_gate_tanh, p.sc_gate_cap);
+    p.sc_sigmoid = pattern::wrap_type<v0::Sigmoid>({p.sc_gate_matmul}, pattern::consumers_count(1));
+    p.sc_gate_act = pattern::wrap_type<v1::Multiply>({p.sc_gate_cap, p.sc_sigmoid}, pattern::consumers_count(1));
+    softcap(p.up_matmul, p.sc_up_scaled, p.sc_up_tanh, p.sc_up_cap);
+    p.sc_swiglu = pattern::wrap_type<v1::Multiply>({p.sc_gate_act, p.sc_up_cap}, pattern::consumers_count(1));
+
+    p.swiglu = p.plain_swiglu | p.sc_swiglu;
 
     // Third GEMM (down_projection)
     p.down_matmul = pattern::wrap_type<v0::MatMul>(
@@ -343,7 +371,8 @@ ConvertTiledMoeBlockTo3GatherMatmuls::ConvertTiledMoeBlockTo3GatherMatmuls(
         const auto& experts_subgraph_input = pm.at(p.experts_input);
         const auto& active_indices = pm.at(p.router_topk_indices);
 
-        const auto gate_mm_node = pm.at(p.gate_matmul).get_node_shared_ptr();
+        const bool is_softcapped = pm.count(p.sc_swiglu) > 0;
+        const auto gate_mm_node = pm.at(is_softcapped ? p.sc_gate_matmul : p.gate_matmul).get_node_shared_ptr();
         const auto up_mm_node = pm.at(p.up_matmul).get_node_shared_ptr();
         const auto down_mm_node = pm.at(p.down_matmul).get_node_shared_ptr();
 
@@ -357,7 +386,20 @@ ConvertTiledMoeBlockTo3GatherMatmuls::ConvertTiledMoeBlockTo3GatherMatmuls(
         ov::replace_node_update_name(gate_mm_node, gate_gathered_mm);
         ov::replace_node_update_name(up_mm_node, up_gathered_mm);
 
-        validate_nodes(pm, {p.swish, p.swiglu});
+        if (is_softcapped) {
+            validate_nodes(pm,
+                           {p.sc_gate_scaled,
+                            p.sc_gate_tanh,
+                            p.sc_gate_cap,
+                            p.sc_sigmoid,
+                            p.sc_gate_act,
+                            p.sc_up_scaled,
+                            p.sc_up_tanh,
+                            p.sc_up_cap,
+                            p.sc_swiglu});
+        } else {
+            validate_nodes(pm, {p.swish, p.plain_swiglu});
+        }
 
         const auto down_gathered_mm =
             std::make_shared<GatherMatmul>(pm.at(p.swiglu), down_mm_node->input_value(1), active_indices);

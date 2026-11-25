@@ -221,7 +221,11 @@ inline bool expert_gemm_compute(
                         int reg_idx_i = (i0 / br) + nbr * (j / bc);
                         int reg_idx_j = (i0 % br) / sg + (j % bc) * (br / sg);
                         float val = c_tile_half.x[reg_idx_i][reg_idx_j];
-#ifdef GATE_ACT_GELU_ERF
+#ifdef GATE_ACT_SWIGLU_SOFTCAP
+                        // softcap(gate) * sigmoid(gate) * softcap(up), softcap(x, c) = c * tanh(x / c)
+                        float act = GATE_SOFTCAP * tanh(val / GATE_SOFTCAP) / (1.0f + native_exp(-val));
+                        post_val = UP_SOFTCAP * tanh(post_val / UP_SOFTCAP);
+#elif defined(GATE_ACT_GELU_ERF)
                         float z_v = fabs(val) * 0.7071067811865475f;
                         float t_v = 1.0f / (1.0f + 0.3275911f * z_v);
                         float erf_v = 1.0f - (((((1.061405429f * t_v + (-1.453152027f)) * t_v + 1.421413741f) * t_v + (-0.284496736f)) * t_v + 0.254829592f)) * t_v * native_exp(-(z_v * z_v));

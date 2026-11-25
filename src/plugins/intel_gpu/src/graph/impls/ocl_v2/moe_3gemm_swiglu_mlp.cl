@@ -191,8 +191,8 @@ inline void gate_up_gemv_n2x_u4(const __global uchar* weight,
         sum_all1 = sub_group_reduce_add(sum_all1);
         if (id_local == 0) {
             if (silu) {
-                y[n] *= MOE_GATE_ACT(sum_all0);
-                y[n + 1] *= MOE_GATE_ACT(sum_all1);
+                y[n] = MOE_UP_ACT(y[n]) * MOE_GATE_ACT(sum_all0);
+                y[n + 1] = MOE_UP_ACT(y[n + 1]) * MOE_GATE_ACT(sum_all1);
             } else {
                 y[n] = sum_all0;
                 y[n + 1] = sum_all1;
@@ -319,8 +319,8 @@ inline void gate_up_gemv_n2x_u8(const __global uchar* weight,
         sum_all1 = sub_group_reduce_add(sum_all1);
         if (id_local == 0) {
             if (silu) {
-                y[n] *= MOE_GATE_ACT(sum_all0);
-                y[n + 1] *= MOE_GATE_ACT(sum_all1);
+                y[n] = MOE_UP_ACT(y[n]) * MOE_GATE_ACT(sum_all0);
+                y[n + 1] = MOE_UP_ACT(y[n + 1]) * MOE_GATE_ACT(sum_all1);
             } else {
                 y[n] = sum_all0;
                 y[n + 1] = sum_all1;
@@ -411,8 +411,8 @@ inline void gate_up_gemv_n2x_f16(const __global half* weight, __global half* y, 
         sum_all1 = sub_group_reduce_add(sum_all1);
         if (id_local == 0) {
             if (silu) {
-                y[n] *= MOE_GATE_ACT(sum_all0);
-                y[n + 1] *= MOE_GATE_ACT(sum_all1);
+                y[n] = MOE_UP_ACT(y[n]) * MOE_GATE_ACT(sum_all0);
+                y[n + 1] = MOE_UP_ACT(y[n + 1]) * MOE_GATE_ACT(sum_all1);
             } else {
                 y[n] = sum_all0;
                 y[n + 1] = sum_all1;

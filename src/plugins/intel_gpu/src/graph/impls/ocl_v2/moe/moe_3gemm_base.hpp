@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "moe_gemm_base.hpp"
+#include "openvino/op/moe.hpp"
 
 namespace ov::intel_gpu::ocl {
 
@@ -67,5 +68,27 @@ struct moe_3gemm_config {
 };
 
 struct MoE3GemmRuntimeParams : public MoEGemmRuntimeParams {};
+
+// Selects the gate activation of the MoE OCL kernels (see moe_gate_activation.cl). Swish is the kernels' default.
+inline void add_moe_gate_activation_jit_constants(JitConstants& jit, const ov::op::internal::MOE::Config& config) {
+    using Activation_type = ov::op::internal::MOE::Activation_type;
+    switch (config.activation_type) {
+    case Activation_type::SWIGLU:
+        break;
+    case Activation_type::GEGLU_TANH:
+        jit.make("GATE_ACT_GELU_TANH", 1);
+        break;
+    case Activation_type::GEGLU_ERF:
+        jit.make("GATE_ACT_GELU_ERF", 1);
+        break;
+    case Activation_type::SWIGLU_SOFTCAP:
+        jit.make("GATE_ACT_SWIGLU_SOFTCAP", 1);
+        jit.make("GATE_SOFTCAP", config.gate_softcap);
+        jit.make("UP_SOFTCAP", config.up_softcap);
+        break;
+    default:
+        OPENVINO_THROW("MoE 3GEMM: unsupported gate activation ", static_cast<int>(config.activation_type));
+    }
+}
 
 }  // namespace ov::intel_gpu::ocl

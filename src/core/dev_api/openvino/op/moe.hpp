@@ -28,6 +28,9 @@ public:
         SWIGLU,      // Swish gate activation (default; matches existing behavior)
         GEGLU_TANH,  // Gelu gate with Tanh approximation
         GEGLU_ERF,   // Gelu gate with ERF (exact) activation
+        // Softcapped SwiGLU: softcap(gate, gate_softcap) * sigmoid(gate) * softcap(up, up_softcap),
+        // where softcap(x, c) = c * tanh(x / c)
+        SWIGLU_SOFTCAP,
     };
 
     struct Config {
@@ -36,6 +39,8 @@ public:
         float expert_beta{1.0f};   // Expert attribute for swish beta
         size_t gate_idx{0};        // gate (swish) lane in interleaved gate/up; GEMM2 only
         Activation_type activation_type{Activation_type::SWIGLU};  // Gate activation; GEMM3 only
+        float gate_softcap{0.0f};  // Bound of the linear gate factor; SWIGLU_SOFTCAP only
+        float up_softcap{0.0f};    // Bound of the up projection; SWIGLU_SOFTCAP only
     };
 
     /// \brief Constructs a MOE operation with config only

@@ -93,8 +93,20 @@ inline float moe_fast_erf(float x) {
     return (x >= 0.0f) ? y : -y;
 }
 
+// Softcapped SwiGLU bounds `up` as UP_SOFTCAP * tanh(up / UP_SOFTCAP); the other activations use it as is
+inline ACC_DTYPE moe_up_activation(ACC_DTYPE x) {
+#if GATE_ACT_SWIGLU_SOFTCAP
+    return UP_SOFTCAP * tanh(x / UP_SOFTCAP);
+#else
+    return x;
+#endif
+}
+
 inline ACC_DTYPE moe_gate_activation(ACC_DTYPE x) {
-#if GATE_ACT_GELU_ERF
+#if GATE_ACT_SWIGLU_SOFTCAP
+    // softcap(x, GATE_SOFTCAP) * sigmoid(x)
+    return GATE_SOFTCAP * tanh(x / GATE_SOFTCAP) / (1.0f + native_exp(-x));
+#elif GATE_ACT_GELU_ERF
     return 0.5f * x * (1.0f + moe_fast_erf(x * 0.7071067811865475f));
 #elif GATE_ACT_GELU_TANH
     return 0.5f * x * (1.0f + (tanh(0.79788458347320556640625f * x * (1.0f + 0.044715f * x * x))));
@@ -121,14 +133,14 @@ KERNEL(swiglu_ref) (
     ACC_DTYPE up_value = as_half(intel_sub_group_block_read_us((const __global ushort *)(up + offset)));
     ACC_DTYPE gate_value = as_half(intel_sub_group_block_read_us((const __global ushort *)(gate + offset)));
     ACC_DTYPE value = moe_gate_activation(gate_value);
-    half result = value * up_value;
+    half result = value * moe_up_activation(up_value);
     intel_sub_group_block_write_us((__global ushort *)(output + offset), as_ushort(result));
 #else
     const uint offset = token_idx * INTERMEDIA_SIZE + n_offset;
     ACC_DTYPE gate_value = gate[offset];
     ACC_DTYPE up_value = up[offset];
     ACC_DTYPE value = moe_gate_activation(gate_value);
-    ACC_DTYPE result = value * up_value;
+    ACC_DTYPE result = value * moe_up_activation(up_value);
     output[offset] = result;
 #endif
 }

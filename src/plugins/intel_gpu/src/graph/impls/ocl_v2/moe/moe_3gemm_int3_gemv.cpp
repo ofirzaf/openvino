@@ -148,18 +148,7 @@ JitConstants MoE3GemmInt3Gemv::get_jit_constants(const RuntimeParams& params) co
     jit.make("SHARED_EXPERT", has_shared_expert(params) ? 1 : 0);
     jit.make("SGN", SGN);
     jit.make("NB", get_nb(params, m_proj));
-    switch (config.activation_type) {
-    case ov::op::internal::MOE::Activation_type::SWIGLU:
-        break;
-    case ov::op::internal::MOE::Activation_type::GEGLU_TANH:
-        jit.make("GATE_ACT_GELU_TANH", 1);
-        break;
-    case ov::op::internal::MOE::Activation_type::GEGLU_ERF:
-        jit.make("GATE_ACT_GELU_ERF", 1);
-        break;
-    default:
-        OPENVINO_THROW("MoE u3 batched GEMV: unsupported gate activation ", static_cast<int>(config.activation_type));
-    }
+    add_moe_gate_activation_jit_constants(jit, config);
     return jit;
 }
 

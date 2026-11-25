@@ -32,7 +32,9 @@
 #include "openvino/op/slice.hpp"
 #include "openvino/op/softmax.hpp"
 #include "openvino/op/squeeze.hpp"
+#include "openvino/op/sigmoid.hpp"
 #include "openvino/op/swish.hpp"
+#include "openvino/op/tanh.hpp"
 #include "openvino/op/tile.hpp"
 #include "openvino/op/topk.hpp"
 #include "openvino/op/transpose.hpp"
@@ -59,7 +61,20 @@ inline std::ostream& operator<<(std::ostream& os, const MoEType& type) {
     }
 }
 
-enum class GateActivationType { SWISH, GELU };
+enum class GateActivationType { SWISH, GELU, SOFTCAPPED_SWIGLU };
+
+// softcap(x, c) = c * Tanh(x / c)
+inline std::shared_ptr<ov::Node> make_softcap(const ov::Output<ov::Node>& x, float cap) {
+    const auto cap_const = ov::op::v0::Constant::create(x.get_element_type(), ov::Shape{}, {cap});
+    const auto tanh = std::make_shared<ov::op::v0::Tanh>(std::make_shared<ov::op::v1::Divide>(x, cap_const));
+    return std::make_shared<ov::op::v1::Multiply>(tanh, cap_const);
+}
+
+// Gate factor of the softcapped SwiGLU: softcap(gate) * Sigmoid(gate). The up projection is softcapped as well.
+inline std::shared_ptr<ov::Node> make_softcapped_gate(const ov::Output<ov::Node>& gate) {
+    const auto sigmoid = std::make_shared<ov::op::v0::Sigmoid>(gate);
+    return std::make_shared<ov::op::v1::Multiply>(make_softcap(gate, 4.0f), sigmoid);
+}
 
 enum class AdditionalConsumersMode { NO, MATMULS, AFTER_MATMULS, REDUCE };
 
@@ -544,9 +559,11 @@ inline std::shared_ptr<ov::Model> initMoE3GeMMSubgraph(bool use_scatter_v12,
 
     gate_matmul->set_friendly_name("GateMatMul");
 
-    // Gate activation: Swish (SwiGLU) or Gelu (GeGLU)
+    // Gate activation: Swish (SwiGLU), Gelu (GeGLU) or softcapped SwiGLU
     std::shared_ptr<ov::Node> gate_act;
-    if (gate_activation == GateActivationType::GELU) {
+    if (gate_activation == GateActivationType::SOFTCAPPED_SWIGLU) {
+        gate_act = make_softcapped_gate(gate_matmul);
+    } else if (gate_activation == GateActivationType::GELU) {
         gate_act = std::make_shared<ov::op::v7::Gelu>(gate_matmul);
     } else {
         gate_act = std::make_shared<ov::op::v4::Swish>(gate_matmul);
@@ -560,7 +577,10 @@ inline std::shared_ptr<ov::Model> initMoE3GeMMSubgraph(bool use_scatter_v12,
 
     up_matmul->set_friendly_name("UpMatMul");
 
-    auto swiglu = std::make_shared<ov::op::v1::Multiply>(gate_act, up_matmul);
+    const bool is_softcapped = gate_activation == GateActivationType::SOFTCAPPED_SWIGLU;
+    auto swiglu = std::make_shared<ov::op::v1::Multiply>(
+        gate_act,
+        is_softcapped ? make_softcap(up_matmul, 25.0f)->output(0) : up_matmul->output(0));
 
     auto down_weights = build_matmul_weights(ov::Shape{number_of_experts, intermediate_size, hidden_size},
                                              weights_precision,
@@ -808,9 +828,11 @@ inline std::shared_ptr<ov::Model> initMoE3GeMMSubgraphRef(
 
     auto gate_gathered_mm = std::make_shared<GatherMatmul>(unsqueeze_experts, gate_weights, router_topk_indices);
 
-    // Gate activation: Swish (SwiGLU) or Gelu (GeGLU)
+    // Gate activation: Swish (SwiGLU), Gelu (GeGLU) or softcapped SwiGLU
     std::shared_ptr<ov::Node> gate_act;
-    if (gate_activation == GateActivationType::GELU) {
+    if (gate_activation == GateActivationType::SOFTCAPPED_SWIGLU) {
+        gate_act = make_softcapped_gate(gate_gathered_mm);
+    } else if (gate_activation == GateActivationType::GELU) {
         gate_act = std::make_shared<ov::op::v7::Gelu>(gate_gathered_mm);
     } else {
         gate_act = std::make_shared<ov::op::v4::Swish>(gate_gathered_mm);
@@ -823,7 +845,10 @@ inline std::shared_ptr<ov::Model> initMoE3GeMMSubgraphRef(
 
     auto up_gathered_mm = std::make_shared<GatherMatmul>(unsqueeze_experts, up_weights, router_topk_indices);
 
-    auto swiglu = std::make_shared<ov::op::v1::Multiply>(gate_act, up_gathered_mm);
+    const bool is_softcapped = gate_activation == GateActivationType::SOFTCAPPED_SWIGLU;
+    auto swiglu = std::make_shared<ov::op::v1::Multiply>(
+        gate_act,
+        is_softcapped ? make_softcap(up_gathered_mm, 25.0f)->output(0) : up_gathered_mm->output(0));
 
     auto down_weights = build_matmul_weights(ov::Shape{number_of_experts, intermediate_size, hidden_size},
                                              weights_precision,
@@ -1053,6 +1078,54 @@ INSTANTIATE_TEST_SUITE_P(ConvertTiledMoeBlockToGatherMatmulsTest_negative_cases_
                                             ::testing::Values(false),
                                             ::testing::Values(false)),
                          ConvertTiledMoeBlockToGatherMatmulsTest::getTestCaseName);
+
+// Softcapped SwiGLU gate: the gate MatMul feeds both the softcap and the Sigmoid
+TEST_F(TransformationTestsF, ConvertTiledMoeBlockToGatherMatmuls_3gemm_softcapped_swiglu) {
+    model = initMoE3GeMMSubgraph(false,
+                                 false,
+                                 false,
+                                 true,
+                                 AdditionalConsumersMode::NO,
+                                 GateActivationType::SOFTCAPPED_SWIGLU);
+    manager.register_pass<ov::pass::ConvertTiledMoeBlockToGatherMatmuls>();
+    model_ref = initMoE3GeMMSubgraphRef(false, false, false, true, GateActivationType::SOFTCAPPED_SWIGLU);
+}
+
+TEST_F(TransformationTestsF, ConvertTiledMoeBlockToGatherMatmuls_3gemm_softcapped_swiglu_keep_dims) {
+    model = initMoE3GeMMSubgraph(true,
+                                 true,
+                                 true,
+                                 true,
+                                 AdditionalConsumersMode::NO,
+                                 GateActivationType::SOFTCAPPED_SWIGLU,
+                                 false,
+                                 true,
+                                 true);
+    manager.register_pass<ov::pass::ConvertTiledMoeBlockToGatherMatmuls>();
+    model_ref =
+        initMoE3GeMMSubgraphRef(true, true, true, true, GateActivationType::SOFTCAPPED_SWIGLU, false, true, true);
+}
+
+// A third consumer of the gate MatMul, or a second consumer of the gate factor: not converted
+TEST_F(TransformationTestsF, ConvertTiledMoeBlockToGatherMatmuls_3gemm_softcapped_swiglu_extra_matmul_consumers) {
+    model = initMoE3GeMMSubgraph(false,
+                                 false,
+                                 false,
+                                 true,
+                                 AdditionalConsumersMode::MATMULS,
+                                 GateActivationType::SOFTCAPPED_SWIGLU);
+    manager.register_pass<ov::pass::ConvertTiledMoeBlockToGatherMatmuls>();
+}
+
+TEST_F(TransformationTestsF, ConvertTiledMoeBlockToGatherMatmuls_3gemm_softcapped_swiglu_extra_activation_consumers) {
+    model = initMoE3GeMMSubgraph(false,
+                                 false,
+                                 false,
+                                 true,
+                                 AdditionalConsumersMode::AFTER_MATMULS,
+                                 GateActivationType::SOFTCAPPED_SWIGLU);
+    manager.register_pass<ov::pass::ConvertTiledMoeBlockToGatherMatmuls>();
+}
 
 // The test models have f32 activations
 using ConvertTiledMoeBlockToGatherMatmulsActivationTypesParams =

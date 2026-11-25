@@ -11,6 +11,7 @@
 #include <openvino/op/concat.hpp>
 #include <openvino/op/constant.hpp>
 #include <openvino/op/convert.hpp>
+#include <openvino/op/divide.hpp>
 #include <openvino/op/gelu.hpp>
 #include <openvino/op/matmul.hpp>
 #include <openvino/op/minimum.hpp>
@@ -19,8 +20,10 @@
 #include <openvino/op/parameter.hpp>
 #include <openvino/op/reduce_sum.hpp>
 #include <openvino/op/reshape.hpp>
+#include <openvino/op/sigmoid.hpp>
 #include <openvino/op/slice.hpp>
 #include <openvino/op/swish.hpp>
+#include <openvino/op/tanh.hpp>
 #include <openvino/op/tile.hpp>
 #include <openvino/op/topk.hpp>
 #include <openvino/pass/manager.hpp>
@@ -317,11 +320,37 @@ inline ov::OutputVector make_expert_weights(size_t number_of_experts,
             zp};
 }
 
+// How the SWIGLU_SOFTCAP gate is written: softcap(gate) * Sigmoid(gate) * softcap(up),
+// softcap(x, c) = c * Tanh(x / c), or c * Tanh(x * (1 / c)) with reciprocal_multiply
+struct MoeSoftcap {
+    float gate = 4.0f;
+    float up = 25.0f;
+    bool reciprocal_multiply = false;
+    float gate_inner_cap = 4.0f;  // differs from `gate` when the two constants do not form a softcap
+};
+
+inline std::shared_ptr<ov::Node> make_softcap(const ov::Output<ov::Node>& x,
+                                              float cap,
+                                              float inner_cap,
+                                              bool reciprocal_multiply) {
+    using namespace ov;
+    std::shared_ptr<Node> scaled;
+    if (reciprocal_multiply) {
+        const auto reciprocal = op::v0::Constant::create(element::f32, Shape{}, {1.0f / inner_cap});
+        scaled = std::make_shared<op::v1::Multiply>(x, reciprocal);
+    } else {
+        scaled = std::make_shared<op::v1::Divide>(x, op::v0::Constant::create(element::f32, Shape{}, {inner_cap}));
+    }
+    return std::make_shared<op::v1::Multiply>(std::make_shared<op::v0::Tanh>(scaled),
+                                              op::v0::Constant::create(element::f32, Shape{}, {cap}));
+}
+
 inline std::shared_ptr<ov::Model> build_3gemm_bgm_model(
     ov::op::internal::MOE::Activation_type activation_type = ov::op::internal::MOE::Activation_type::SWIGLU,
     bool has_batch_dim = true,
     bool restore_output_shape = false,
-    const std::optional<MoeCompression>& compression = std::nullopt) {
+    const std::optional<MoeCompression>& compression = std::nullopt,
+    const MoeSoftcap& softcap = {}) {
     using namespace ov;
 
     const size_t batch = 2;
@@ -368,8 +397,13 @@ inline std::shared_ptr<ov::Model> build_3gemm_bgm_model(
 
     // 3 BGMs
     auto bgm_gate = make_bgm(unsqueeze, intermediate_size, hidden_size);
+    const bool is_softcapped = activation_type == ov::op::internal::MOE::Activation_type::SWIGLU_SOFTCAP;
     std::shared_ptr<ov::Node> gate_act;
-    if (activation_type == ov::op::internal::MOE::Activation_type::GEGLU_TANH) {
+    if (is_softcapped) {
+        gate_act = std::make_shared<op::v1::Multiply>(
+            make_softcap(bgm_gate, softcap.gate, softcap.gate_inner_cap, softcap.reciprocal_multiply),
+            std::make_shared<op::v0::Sigmoid>(bgm_gate));
+    } else if (activation_type == ov::op::internal::MOE::Activation_type::GEGLU_TANH) {
         gate_act = std::make_shared<op::v7::Gelu>(bgm_gate, ov::op::GeluApproximationMode::TANH);
     } else if (activation_type == ov::op::internal::MOE::Activation_type::GEGLU_ERF) {
         gate_act = std::make_shared<op::v7::Gelu>(bgm_gate, ov::op::GeluApproximationMode::ERF);
@@ -377,7 +411,10 @@ inline std::shared_ptr<ov::Model> build_3gemm_bgm_model(
         gate_act = std::make_shared<op::v4::Swish>(bgm_gate);
     }
     auto bgm_up = make_bgm(unsqueeze, intermediate_size, hidden_size);
-    auto swiglu = std::make_shared<op::v1::Multiply>(gate_act, bgm_up);
+    auto swiglu = std::make_shared<op::v1::Multiply>(
+        gate_act,
+        is_softcapped ? make_softcap(bgm_up, softcap.up, softcap.up, softcap.reciprocal_multiply)->output(0)
+                      : bgm_up->output(0));
     auto bgm_down = make_bgm(swiglu, hidden_size, intermediate_size);
 
     // Compact routing: chosen_experts → Transpose({1,0}) → Unsqueeze(-1)
@@ -410,7 +447,8 @@ inline std::shared_ptr<ov::Model> build_3gemm_bgm_to_moe_reference_model(
     ov::op::internal::MOE::Activation_type activation_type = ov::op::internal::MOE::Activation_type::SWIGLU,
     bool has_batch_dim = true,
     bool restore_output_shape = false,
-    const std::optional<MoeCompression>& compression = std::nullopt) {
+    const std::optional<MoeCompression>& compression = std::nullopt,
+    const MoeSoftcap& softcap = {}) {
     using namespace ov;
 
     const size_t batch = 2;
@@ -453,11 +491,18 @@ inline std::shared_ptr<ov::Model> build_3gemm_bgm_to_moe_reference_model(
         moe_inputs.insert(moe_inputs.end(), w.begin(), w.end());
     }
 
+    const bool is_softcapped = activation_type == ov::op::internal::MOE::Activation_type::SWIGLU_SOFTCAP;
+    ov::op::internal::MOE::Config base_config;
+    base_config.expert_type = ov::op::internal::MOE::Expert_type::GEMM3_SWIGLU;
+    base_config.activation_type = activation_type;
+    base_config.gate_softcap = is_softcapped ? softcap.gate : 0.0f;
+    base_config.up_softcap = is_softcapped ? softcap.up : 0.0f;
+
     ov::Output<ov::Node> output;
     if (compression) {
         using ov::op::internal::MOECompressed;
         MOECompressed::Config config{
-            {ov::op::internal::MOE::Expert_type::GEMM3_SWIGLU, 0.0f, 1.0f, 0, activation_type},
+            base_config,
             hidden_size,
             intermediate_size,
             number_of_experts,
@@ -471,10 +516,7 @@ inline std::shared_ptr<ov::Model> build_3gemm_bgm_to_moe_reference_model(
         auto moe = std::make_shared<MOECompressed>(moe_inputs, config);
         output = std::make_shared<op::v0::Convert>(moe, input->get_element_type());
     } else {
-        ov::op::internal::MOE::Config config;
-        config.expert_type = ov::op::internal::MOE::Expert_type::GEMM3_SWIGLU;
-        config.activation_type = activation_type;
-        output = std::make_shared<ov::op::internal::MOE>(moe_inputs, config);
+        output = std::make_shared<ov::op::internal::MOE>(moe_inputs, base_config);
     }
 
     if (!has_batch_dim || restore_output_shape) {
@@ -861,6 +903,37 @@ TEST_F(TransformationTestsF, Convert3GatherMatmulMoeBlockToMoeOp_gelu_erf) {
     model = build_3gemm_bgm_model(AT::GEGLU_ERF);
     manager.register_pass<ov::pass::Convert3GatherMatmulMoeBlockToMoeOp>();
     model_ref = build_3gemm_bgm_to_moe_reference_model(AT::GEGLU_ERF);
+}
+
+TEST_F(TransformationTestsF, Convert3GatherMatmulMoeBlockToMoeOp_swiglu_softcap) {
+    using AT = ov::op::internal::MOE::Activation_type;
+    model = build_3gemm_bgm_model(AT::SWIGLU_SOFTCAP);
+    manager.register_pass<ov::pass::Convert3GatherMatmulMoeBlockToMoeOp>();
+    model_ref = build_3gemm_bgm_to_moe_reference_model(AT::SWIGLU_SOFTCAP);
+}
+
+TEST_F(TransformationTestsF, Convert3GatherMatmulMoeBlockToMoeOp_swiglu_softcap_reciprocal_multiply) {
+    using AT = ov::op::internal::MOE::Activation_type;
+    const MoeSoftcap softcap{3.0f, 16.0f, true, 3.0f};
+    model = build_3gemm_bgm_model(AT::SWIGLU_SOFTCAP, true, false, std::nullopt, softcap);
+    manager.register_pass<ov::pass::Convert3GatherMatmulMoeBlockToMoeOp>();
+    model_ref = build_3gemm_bgm_to_moe_reference_model(AT::SWIGLU_SOFTCAP, true, false, std::nullopt, softcap);
+}
+
+TEST_F(TransformationTestsF, Convert3GatherMatmulMoeBlockToMoeOp_swiglu_softcap_compressed) {
+    using AT = ov::op::internal::MOE::Activation_type;
+    using ov::test::utils::DecompressionType;
+    const MoeCompression compression{ov::element::u4, DecompressionType::full, ov::element::u4};
+    model = build_3gemm_bgm_model(AT::SWIGLU_SOFTCAP, false, false, compression);
+    manager.register_pass<ov::pass::Convert3GatherMatmulMoeBlockToMoeOp>();
+    model_ref = build_3gemm_bgm_to_moe_reference_model(AT::SWIGLU_SOFTCAP, false, false, compression);
+}
+
+// Tanh(gate / 2) * 4 is not a softcap: the block stays as it is
+TEST_F(TransformationTestsF, Convert3GatherMatmulMoeBlockToMoeOp_swiglu_softcap_mismatched_constants) {
+    using AT = ov::op::internal::MOE::Activation_type;
+    model = build_3gemm_bgm_model(AT::SWIGLU_SOFTCAP, true, false, std::nullopt, MoeSoftcap{4.0f, 25.0f, false, 2.0f});
+    manager.register_pass<ov::pass::Convert3GatherMatmulMoeBlockToMoeOp>();
 }
 
 TEST_F(TransformationTestsF, Convert3GatherMatmulMoeBlockToMoeOp_multiply_input) {

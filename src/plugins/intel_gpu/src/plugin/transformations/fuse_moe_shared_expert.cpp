@@ -37,7 +37,10 @@ FuseMOESharedExpert::FuseMOESharedExpert() {
 
     auto is_gemm3_swiglu = [](const ov::Output<ov::Node>& output) {
         auto moe = ov::as_type_ptr<ov::op::internal::MOE>(output.get_node_shared_ptr());
-        return moe && moe->get_config().expert_type == ov::op::internal::MOE::Expert_type::GEMM3_SWIGLU;
+        // The shared expert runs with the gate activation of the experts, as OneDNN post-ops:
+        // the softcapped SwiGLU has no such implementation
+        return moe && moe->get_config().expert_type == ov::op::internal::MOE::Expert_type::GEMM3_SWIGLU &&
+               moe->get_config().activation_type != ov::op::internal::MOE::Activation_type::SWIGLU_SOFTCAP;
     };
 
     auto moe_base_m = wrap_type<ov::op::internal::MOE>({hidden_states_m, routing_weights_m, topk_m,

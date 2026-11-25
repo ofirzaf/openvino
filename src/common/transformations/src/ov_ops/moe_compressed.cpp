@@ -26,6 +26,11 @@ void MOECompressed::validate_and_infer_types() {
                               m_config.activation_type == Activation_type::SWIGLU,
                               "GEMM2_BIAS_SWIGLU_CLAMP expert type only supports SWIGLU activation");
     }
+    if (m_config.activation_type == Activation_type::SWIGLU_SOFTCAP) {
+        NODE_VALIDATION_CHECK(this,
+                              m_config.gate_softcap > 0.0f && m_config.up_softcap > 0.0f,
+                              "SWIGLU_SOFTCAP activation requires positive gate_softcap and up_softcap");
+    }
 
     // Check that routing_weights and router_topk_output_indices have the same shape
     const auto& routing_weights_shape = get_input_partial_shape(1);
