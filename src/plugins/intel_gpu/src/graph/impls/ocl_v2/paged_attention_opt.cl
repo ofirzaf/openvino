@@ -95,6 +95,17 @@ inline uint FUNC(pa_bidir_group_begin)(const __global int* token_type_ids, const
 #define _VEC_ELEMENT_ACCESSOR(VECTOR_SIZE, vec, idx) CAT(_VEC_,CAT(VECTOR_SIZE,_ELEMENT_ACCESSOR))(vec, idx)
 #define GET_VECTOR_ELEMENT(vec, idx) _VEC_ELEMENT_ACCESSOR(QUERIES_PER_WI, vec, idx)
 
+// Sink logit of query head `q_idx` of this work-item: a value per head, or per query token and head (SINK_PER_TOKEN).
+// HEADS_PER_WI > 1: the last iteration of a KV heads group may have fewer heads, their results are not used.
+#if HAS_SINK_INPUT
+#define PA_SINK_HEAD_IDX(q_idx) min(head_num_idx + (q_idx), (uint)(HEADS_NUM - 1))
+#if SINK_PER_TOKEN
+#define PA_SINK_VALUE(q_idx) TO_SOFTMAX_ACCUMULATOR_TYPE(sink_ptr[seq_idx * HEADS_NUM + PA_SINK_HEAD_IDX(q_idx)])
+#else
+#define PA_SINK_VALUE(q_idx) TO_SOFTMAX_ACCUMULATOR_TYPE(sink_ptr[PA_SINK_HEAD_IDX(q_idx)])
+#endif
+#endif
+
 REQD_SUB_GROUP_SIZE(SUBGROUP_SIZE)
 #ifdef USE_DUAL_NIBBLE_V_OPT
 __attribute__((reqd_work_group_size(1, 1, PACKED_V_HEAD_SIZE * SG_SCALE_FACTOR)))
@@ -117,6 +128,8 @@ KERNEL(pa_sdpa_opt)(
 #endif
 #if HAS_ALIBI
     const __global ALIBI_INPUT_TYPE* alibi_slopes,
+#elif HAS_BIAS_TABLE
+    const __global BIAS_TABLE_DATA_T* bias_table,
 #endif
 #if HAS_SINK_INPUT
     const __global SINK_DATA_T* sink_ptr,
@@ -500,6 +513,22 @@ KERNEL(pa_sdpa_opt)(
             unroll_for (uint q_idx = 0; q_idx < HEADS_PER_WI; q_idx++) {
                 GET_VECTOR_ELEMENT(qk_acc, q_idx) += alibi_slopes[head_num_idx + q_idx] * alibi_val;
             }
+#elif defined(HAS_BIAS_TABLE)
+            // Relative position bias: every query token has BIAS_TABLE_EXTENT values per head, indexed by the backward
+            // distance to the key, and no bias from BIAS_TABLE_EXTENT on. For the keys after the query the unsigned
+            // distance wraps around: they get no bias and are masked below.
+#if HAS_TOKEN_TYPE_IDS && MULTI_TOKENS_PROCESSING
+            const uint bias_distance = (causal_len - 1) - token_idx;
+#else
+            const uint bias_distance = (seq_len - 1) - token_idx;
+#endif
+            if (bias_distance < BIAS_TABLE_EXTENT) {
+                unroll_for (uint q_idx = 0; q_idx < HEADS_PER_WI; q_idx++) {
+                    // HEADS_PER_WI > 1: the last iteration of a KV heads group may have fewer heads, their results are not used
+                    const uint bias_head_idx = min(head_num_idx + q_idx, (uint)(HEADS_NUM - 1));
+                    GET_VECTOR_ELEMENT(qk_acc, q_idx) += bias_table[(seq_idx * HEADS_NUM + bias_head_idx) * BIAS_TABLE_EXTENT + bias_distance];
+                }
+            }
 #endif
 
 #if SLIDING_WINDOW_SIZE != 0
@@ -568,8 +597,8 @@ KERNEL(pa_sdpa_opt)(
             // If sink were included in every partition, the finalization would count the sink
             // contribution P times (once per partition) instead of once.
             if (partition_idx == 0) {
-                const uint head_idx = get_global_id(1);
-                GET_VECTOR_ELEMENT(qk_max, q_idx) = qk_max_tmp > sink_ptr[head_idx] ? qk_max_tmp : sink_ptr[head_idx];
+                const SOFTMAX_ACCUMULATOR_TYPE sink_val = PA_SINK_VALUE(q_idx);
+                GET_VECTOR_ELEMENT(qk_max, q_idx) = qk_max_tmp > sink_val ? qk_max_tmp : sink_val;
             } else {
                 GET_VECTOR_ELEMENT(qk_max, q_idx) = qk_max_tmp;
             }
@@ -624,8 +653,7 @@ KERNEL(pa_sdpa_opt)(
             GET_VECTOR_ELEMENT(exp_sum, q_idx) = sub_group_reduce_add(GET_VECTOR_ELEMENT(exp_sum, q_idx));
             #ifdef HAS_SINK_INPUT
             if (partition_idx == 0) {
-                const uint head_idx = get_global_id(1);
-                GET_VECTOR_ELEMENT(exp_sum, q_idx) += (native_exp(TO_SOFTMAX_ACCUMULATOR_TYPE(sink_ptr[head_idx]) - GET_VECTOR_ELEMENT(qk_max, q_idx)));
+                GET_VECTOR_ELEMENT(exp_sum, q_idx) += (native_exp(PA_SINK_VALUE(q_idx) - GET_VECTOR_ELEMENT(qk_max, q_idx)));
             }
             #endif
         }

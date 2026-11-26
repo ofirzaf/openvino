@@ -62,6 +62,23 @@ inline std::optional<GQAMultiTokensKernel> get_forced_gqa_multi_tokens_kernel() 
     return value;
 }
 
+// The ALIBI input is passed to the kernels when it holds ALiBi slopes or a table of bias values. The layout cannot
+// be asked for its size: the table is computed in the model and has a dynamic shape when the kernels are built.
+inline bool has_position_bias_input(const kernel_impl_params& params) {
+    const auto desc = params.typed_desc<paged_attention>();
+    return desc->has_alibi || desc->has_bias_table();
+}
+
+// Table of bias values per query token, head and backward distance to the key (see paged_attention::bias_table_extent)
+inline void add_bias_table_jit_constants(JitConstants& jit, const kernel_impl_params& params) {
+    const auto desc = params.typed_desc<paged_attention>();
+    if (desc->has_bias_table()) {
+        jit.make("HAS_BIAS_TABLE", 1);
+        jit.make("BIAS_TABLE_EXTENT", desc->bias_table_extent);
+        jit.make("BIAS_TABLE_DATA_T", to_ocl_type(params.input_layouts[PagedAttentionInputIdx::ALIBI].data_type));
+    }
+}
+
 inline bool get_kv_compressed(const RuntimeParams& params) {
     auto key_cache_layout = params.input_layouts[PagedAttentionInputIdx::KEY_CACHE];
     return data_type_traits::is_i8_u8(key_cache_layout.data_type) || data_type_traits::is_i4_u4(key_cache_layout.data_type);
@@ -180,7 +197,7 @@ inline bool prefer_gqa_multi_tokens_fallback_kernel(size_t max_tokens, size_t ma
 inline bool supports_gqa_multi_tokens_fallback_kernel(const kernel_impl_params& params) {
     const auto desc = params.typed_desc<paged_attention>();
     const size_t kv_group_size = desc->heads_num / desc->kv_heads_num;
-    return kv_group_size > 1 && !desc->has_sink_input && !desc->has_scores_output();
+    return kv_group_size > 1 && !desc->has_sink_input && !desc->has_scores_output() && !desc->has_bias_table();
 }
 
 inline bool supports_gqa_multi_tokens_dpas_kernel(const kernel_impl_params& params) {
@@ -509,11 +526,15 @@ public:
             jit.make("HAS_ALIBI", 1);
             jit.add(make_type_jit_constants("ALIBI_INPUT", params.input_layouts[alibi_input_idx].data_type));
         }
+        add_bias_table_jit_constants(jit, params);
 
         if (desc->has_sink_input) {
             const auto& sink_layout = params.input_layouts[PagedAttentionInputIdx::SINKS];
             jit.make("SINK_DATA_T", to_ocl_type(sink_layout.data_type));
             jit.make("HAS_SINK_INPUT", 1);
+            if (desc->has_per_token_sinks) {
+                jit.make("SINK_PER_TOKEN", 1);
+            }
         }
         if (desc->has_scores_output()) {
             jit.make("PAGED_ATTENTION_SCORES_OUTPUT", 1);
@@ -567,7 +588,6 @@ public:
         jit.make("HEADS_PER_WI", 1);
 
         const auto desc = params.typed_desc<paged_attention>();
-        const auto has_alibi = params.get_input_layout(PagedAttentionInputIdx::ALIBI).count() > 0;
         const auto has_scale_input = !desc->scale_val.has_value();
 
         const auto& in_offsets_map = params.in_port_to_shape_info_offset;
@@ -587,7 +607,7 @@ public:
             const size_t tensor_id = PagedAttentionInputIdx::SCALE;
             jit.add(make_layout_jit_constants("INPUT" + to_code_string(6), params.input_layouts[tensor_id], in_offsets_map.at(tensor_id)));
         }
-        if (has_alibi) {
+        if (desc->has_alibi) {
             const size_t tensor_id = PagedAttentionInputIdx::ALIBI;
             jit.add(make_layout_jit_constants("INPUT" + to_code_string(7), params.input_layouts[tensor_id], in_offsets_map.at(tensor_id)));
         }
@@ -600,7 +620,7 @@ public:
         Arguments args;
 
         const auto desc = params.typed_desc<paged_attention>();
-        const auto has_alibi = params.get_input_layout(PagedAttentionInputIdx::ALIBI).count() > 0;
+        const auto has_alibi = has_position_bias_input(params);
         const auto has_scale_input = !desc->scale_val.has_value();
         const auto has_scores_output = desc->has_scores_output();
         const auto has_sink_input = desc->has_sink_input;
@@ -755,7 +775,6 @@ public:
         if (desc->has_token_type_ids) {
             jit.make("HAS_TOKEN_TYPE_IDS", 1);
         }
-        const auto has_alibi = params.get_input_layout(PagedAttentionInputIdx::ALIBI).count() > 0;
         const auto has_qq_bias = desc->has_qq_bias;
         const auto has_scale_input = !desc->scale_val.has_value();
 
@@ -777,7 +796,7 @@ public:
             const size_t tensor_id = PagedAttentionInputIdx::SCALE;
             jit.add(make_layout_jit_constants("INPUT" + to_code_string(7), params.input_layouts[tensor_id], in_offsets_map.at(tensor_id)));
         }
-        if (has_alibi) {
+        if (desc->has_alibi) {
             const size_t tensor_id = PagedAttentionInputIdx::ALIBI;
             jit.add(make_layout_jit_constants("INPUT" + to_code_string(8), params.input_layouts[tensor_id], in_offsets_map.at(tensor_id)));
         }
@@ -802,7 +821,7 @@ public:
         Arguments args;
 
         const auto desc = params.typed_desc<paged_attention>();
-        const auto has_alibi = params.get_input_layout(PagedAttentionInputIdx::ALIBI).count() > 0;
+        const auto has_alibi = has_position_bias_input(params);
         const auto has_qq_bias = desc->has_qq_bias;
         const auto has_scale_input = !desc->scale_val.has_value();
         const auto has_scores_output = desc->has_scores_output();
@@ -1455,7 +1474,7 @@ public:
     PagedAttentionSDPAOptGeneratorMultiToken() : SDPAOptGeneratorBase("sdpa_opt", "_multi_tokens", false) {}
     [[nodiscard]] Arguments get_arguments_desc(const kernel_impl_params& params) const override {
         const auto desc = params.typed_desc<paged_attention>();
-        const auto has_alibi = params.get_input_layout(PagedAttentionInputIdx::ALIBI).count() > 0;
+        const auto has_alibi = has_position_bias_input(params);
         const auto has_scale_input = !desc->scale_val.has_value();
         const auto has_scores_output = desc->has_scores_output();
         const auto has_score_aggregation = desc->has_score_aggregation;
@@ -1513,7 +1532,6 @@ public:
     [[nodiscard]] JitConstants get_jit_constants(const kernel_impl_params& params) const override {
         auto jit = SDPAOptGeneratorBase::get_jit_constants_base(params, SDPAStage::MULTI_TOKENS, false);
         const auto desc = params.typed_desc<paged_attention>();
-        const auto has_alibi = params.get_input_layout(PagedAttentionInputIdx::ALIBI).count() > 0;
         const auto has_scale_input = !desc->scale_val.has_value();
 
         const auto& in_offsets_map = params.in_port_to_shape_info_offset;
@@ -1532,7 +1550,7 @@ public:
             const size_t tensor_id = PagedAttentionInputIdx::SCALE;
             jit.add(make_layout_jit_constants("INPUT4", params.input_layouts[tensor_id], in_offsets_map.at(tensor_id)));
         }
-        if (has_alibi) {
+        if (desc->has_alibi) {
             const size_t tensor_id = PagedAttentionInputIdx::ALIBI;
             if (has_scale_input) {
                 jit.add(make_layout_jit_constants("INPUT5", params.input_layouts[tensor_id], in_offsets_map.at(tensor_id)));
@@ -1562,7 +1580,11 @@ public:
             const auto& sink_layout = params.input_layouts[PagedAttentionInputIdx::SINKS];
             jit.make("SINK_DATA_T", to_ocl_type(sink_layout.data_type));
             jit.make("HAS_SINK_INPUT", 1);
+            if (desc->has_per_token_sinks) {
+                jit.make("SINK_PER_TOKEN", 1);
+            }
         }
+        add_bias_table_jit_constants(jit, params);
 
         return jit;
     }
@@ -1729,6 +1751,11 @@ public:
             return false;
         }
 
+        // TODO: bias table and per-token sinks in the micro kernel
+        if (desc->has_bias_table() || desc->has_per_token_sinks) {
+            return false;
+        }
+
         // Disable micro SDPA for INT4 BY_TOKEN due to accuracy issues
         const auto kv_cache_dt = params.get_program().get_config().get_kv_cache_precision();
         return !data_type_traits::is_i4_u4(kv_cache_dt) || desc->is_key_by_channel;
@@ -1818,11 +1845,7 @@ public:
 
         rt_params->gqa_multi_tokens_kernel = GQAMultiTokensKernel::NONE;
         if (rt_params->stage == PagedAttentionStage::GENERATE) {
-            if (desc->has_sink_input) {
-                rt_params->use_gqa_kernel = false;
-            } else {
-                rt_params->use_gqa_kernel = can_use_gqa_kernel(params, PagedAttentionStage::GENERATE, rt_params->max_context_len);
-            }
+            rt_params->use_gqa_kernel = can_use_gqa_kernel(params, PagedAttentionStage::GENERATE, rt_params->max_context_len);
         } else if (rt_params->stage == PagedAttentionStage::MIXED && !rt_params->use_micro_sdpa) {
             rt_params->gqa_multi_tokens_kernel = select_gqa_multi_tokens_kernel(params, rt_params->stage);
             rt_params->use_gqa_kernel = rt_params->gqa_multi_tokens_kernel != GQAMultiTokensKernel::NONE;

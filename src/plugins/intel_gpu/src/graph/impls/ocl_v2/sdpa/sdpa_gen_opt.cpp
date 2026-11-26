@@ -46,6 +46,7 @@ JitConstants SDPAOptGeneratorBase::get_jit_constants_base(const kernel_impl_para
         if (desc->has_alibi) {
             jit.make("HAS_ALIBI", 1);
         }
+        // HAS_BIAS_TABLE is set with its other constants by the PagedAttention kernel generator
 
         if (params.output_layouts.size() > 1) {
             jit.make("PAGED_ATTENTION_SCORES_OUTPUT", 1);

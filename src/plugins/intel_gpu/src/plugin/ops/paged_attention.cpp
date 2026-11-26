@@ -84,9 +84,20 @@ static void CreatePagedAttentionExtensionOp(ProgramBuilder& p, const std::shared
         prim.sliding_window = sliding_windows_const->cast_vector<size_t>()[0];
     }
 
-    auto alibi_const = ov::as_type_ptr<ov::op::v0::Constant>(op->get_input_node_shared_ptr(alibi_idx));
-    OPENVINO_ASSERT(alibi_const != nullptr);
-    prim.has_alibi = ov::shape_size(alibi_const->get_output_shape(0)) > 0;
+    const auto& alibi_ps = op->get_input_partial_shape(alibi_idx);
+    if (alibi_ps.rank().is_static() && alibi_ps.rank().get_length() == 3) {
+        // A table of bias values per query token, head and backward distance, computed in the model
+        OPENVINO_ASSERT(alibi_ps[1].is_static() && alibi_ps[1].get_length() == heads_num && alibi_ps[2].is_static() && alibi_ps[2].get_length() > 0,
+                        "[GPU] PagedAttention bias table must have the shape [tokens, ",
+                        heads_num,
+                        ", extent] with a static extent, got ",
+                        alibi_ps);
+        prim.bias_table_extent = static_cast<size_t>(alibi_ps[2].get_length());
+    } else {
+        auto alibi_const = ov::as_type_ptr<ov::op::v0::Constant>(op->get_input_node_shared_ptr(alibi_idx));
+        OPENVINO_ASSERT(alibi_const != nullptr);
+        prim.has_alibi = ov::shape_size(alibi_const->get_output_shape(0)) > 0;
+    }
 
     auto score_aggregation_input = ov::as_type_ptr<ov::op::v0::Parameter>(op->get_input_node_shared_ptr(score_aggregation_idx));
     if (score_aggregation_input && score_aggregation_input->get_output_partial_shape(0).is_dynamic() && op->get_output_size() > 1) {
@@ -112,9 +123,20 @@ static void CreatePagedAttentionExtensionOp(ProgramBuilder& p, const std::shared
     }
 
     const size_t sinks_idx = cldnn::paged_attention::PagedAttentionInputIdx::SINKS;
-    auto sinks_const = ov::as_type_ptr<ov::op::v0::Constant>(op->get_input_node_shared_ptr(sinks_idx));
-    OPENVINO_ASSERT(sinks_const != nullptr);
-    prim.has_sink_input = ov::shape_size(sinks_const->get_output_shape(0)) > 0;
+    if (auto sinks_const = ov::as_type_ptr<ov::op::v0::Constant>(op->get_input_node_shared_ptr(sinks_idx))) {
+        prim.has_sink_input = ov::shape_size(sinks_const->get_output_shape(0)) > 0;
+    } else {
+        // A sink per query token and head, computed in the model
+        const auto& sinks_ps = op->get_input_partial_shape(sinks_idx);
+        OPENVINO_ASSERT(sinks_ps.rank().is_static() && sinks_ps.rank().get_length() == 4 && sinks_ps[1].is_static() && sinks_ps[1].get_length() == heads_num &&
+                            sinks_ps[2].compatible(1) && sinks_ps[3].compatible(1),
+                        "[GPU] PagedAttention sinks computed in the model must have the shape [tokens, ",
+                        heads_num,
+                        ", 1, 1], got ",
+                        sinks_ps);
+        prim.has_sink_input = true;
+        prim.has_per_token_sinks = true;
+    }
 
     const size_t token_type_ids_idx = cldnn::paged_attention::PagedAttentionInputIdx::TOKEN_TYPE_IDS;
     const auto token_type_ids_ps = op->get_input_node_shared_ptr(token_type_ids_idx)->get_output_partial_shape(0);

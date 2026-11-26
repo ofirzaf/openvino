@@ -89,6 +89,8 @@ struct paged_attention : public primitive_base<paged_attention> {
             seed = hash_combine(seed, scale_val.value());
         }
         seed = hash_combine(seed, is_key_by_channel);
+        seed = hash_combine(seed, bias_table_extent);
+        seed = hash_combine(seed, has_per_token_sinks);
 
         return seed;
     }
@@ -105,7 +107,8 @@ struct paged_attention : public primitive_base<paged_attention> {
                sliding_window == rhs_casted.sliding_window && has_score_aggregation == rhs_casted.has_score_aggregation &&
                has_xattention == rhs_casted.has_xattention && has_sink_input == rhs_casted.has_sink_input && has_adaptive_rkv == rhs_casted.has_adaptive_rkv &&
                has_token_type_ids == rhs_casted.has_token_type_ids && has_qq_bias == rhs_casted.has_qq_bias && write_kv_cache == rhs_casted.write_kv_cache &&
-               scale_val.value_or(1.0F) == rhs_casted.scale_val.value_or(1.0F) && is_key_by_channel == rhs_casted.is_key_by_channel;
+               scale_val.value_or(1.0F) == rhs_casted.scale_val.value_or(1.0F) && is_key_by_channel == rhs_casted.is_key_by_channel &&
+               bias_table_extent == rhs_casted.bias_table_extent && has_per_token_sinks == rhs_casted.has_per_token_sinks;
     }
 
     void save(BinaryOutputBuffer& ob) const override {
@@ -132,6 +135,8 @@ struct paged_attention : public primitive_base<paged_attention> {
             ob << false;
         }
         ob << is_key_by_channel;
+        ob << bias_table_extent;
+        ob << has_per_token_sinks;
     }
 
     void load(BinaryInputBuffer& ib) override {
@@ -161,6 +166,8 @@ struct paged_attention : public primitive_base<paged_attention> {
             scale_val = std::optional<float>();
         }
         ib >> is_key_by_channel;
+        ib >> bias_table_extent;
+        ib >> has_per_token_sinks;
     }
 
     std::optional<float> scale_val;
@@ -179,5 +186,15 @@ struct paged_attention : public primitive_base<paged_attention> {
     bool is_key_by_channel = false;
     bool has_qq_bias = false;
     bool write_kv_cache = true;
+    // > 0: the ALIBI input is not ALiBi slopes but a table of bias values [tokens, heads_num, bias_table_extent]:
+    // a query token adds table[token, head, distance] to the logit of the key `distance` positions back, and nothing
+    // to the keys at a distance of bias_table_extent or more
+    size_t bias_table_extent = 0;
+    // The SINKS input has a value per query token and head, [tokens, heads_num, 1, 1], instead of one per head
+    bool has_per_token_sinks = false;
+
+    bool has_bias_table() const {
+        return bias_table_extent > 0;
+    }
 };
 }  // namespace cldnn

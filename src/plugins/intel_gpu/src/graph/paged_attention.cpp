@@ -135,6 +135,8 @@ std::string paged_attention_inst::to_string(const paged_attention_node& node) {
     paged_attention_info.add("heads_num", desc->heads_num);
     paged_attention_info.add("kv_heads_num", desc->kv_heads_num);
     paged_attention_info.add("has_alibi", desc->has_alibi);
+    paged_attention_info.add("bias_table_extent", desc->bias_table_extent);
+    paged_attention_info.add("has_per_token_sinks", desc->has_per_token_sinks);
     paged_attention_info.add("has_rotated_blocks", desc->has_rotated_blocks);
     paged_attention_info.add("sliding_window", desc->sliding_window);
     paged_attention_info.add("score_output", desc->has_scores_output());

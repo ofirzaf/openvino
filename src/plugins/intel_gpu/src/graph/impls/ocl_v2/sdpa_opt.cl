@@ -1360,6 +1360,8 @@ KERNEL(sdpa_opt)(
 #endif
 #if IS_PAGED_ATTENTION && HAS_ALIBI
     const __global ALIBI_TYPE* alibi_slopes,
+#elif IS_PAGED_ATTENTION && HAS_BIAS_TABLE
+    const __global BIAS_TABLE_DATA_T* bias_table,
 #endif
 #if IS_PAGED_ATTENTION && HAS_TOKEN_TYPE_IDS
     const __global int* token_type_ids,
@@ -2089,6 +2091,14 @@ KERNEL(sdpa_opt)(
 #ifdef HAS_ALIBI
                         const int alibi_val = (1 - SOURCE_SEQ_LEN) + seq_len + i;
                         qk_acc[i] += alibi_slopes[num_heads_dim] * alibi_val;
+#elif IS_PAGED_ATTENTION && defined(HAS_BIAS_TABLE)
+                        // Relative position bias: every query token has BIAS_TABLE_EXTENT values per head, indexed by the
+                        // backward distance to the key, and no bias from BIAS_TABLE_EXTENT on. This work-item is query
+                        // token `sglid` of the block; for the keys after the query the unsigned distance wraps around.
+                        const uint bias_distance = (target_seq_idx + sglid) - (uint)(seq_len + i);
+                        if (sglid < seq_idx_end && bias_distance < BIAS_TABLE_EXTENT) {
+                            qk_acc[i] += bias_table[((block_start_pos + sglid) * NUM_HEADS + num_heads_dim) * BIAS_TABLE_EXTENT + bias_distance];
+                        }
 #endif
 
                         // Also turns the NaN mask of keys past the sequence end into the minimum.
@@ -2739,8 +2749,14 @@ KERNEL(sdpa_opt)(
         // The running max/exp_sum were last written by work item 0 of the final partition; make them visible
         // to every subgroup before they are read below.
         barrier(CLK_LOCAL_MEM_FENCE);
+#if !(IS_PAGED_ATTENTION && SINK_PER_TOKEN)
         SOFTMAX_ACCUMULATOR_TYPE sink_val = TO_SOFTMAX_ACCUMULATOR_TYPE(sink_ptr[b1_idx]);
+#endif
         for (uint seq_idx = 0; seq_idx < seq_idx_end; seq_idx++) {
+#if IS_PAGED_ATTENTION && SINK_PER_TOKEN
+            // a sink per query token and head: [tokens, NUM_HEADS]
+            SOFTMAX_ACCUMULATOR_TYPE sink_val = TO_SOFTMAX_ACCUMULATOR_TYPE(sink_ptr[(block_start_pos + seq_idx) * NUM_HEADS + num_heads_dim]);
+#endif
             SOFTMAX_ACCUMULATOR_TYPE max_prev = slm_max_val_prev[seq_idx];
             SOFTMAX_ACCUMULATOR_TYPE max_new = SOFTMAX_ACCUMULATOR_MAX_FUNC(max_prev, sink_val);
             SOFTMAX_ACCUMULATOR_TYPE correction = native_exp(max_prev - max_new);
