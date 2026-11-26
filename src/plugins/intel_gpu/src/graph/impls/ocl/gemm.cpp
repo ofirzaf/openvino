@@ -228,7 +228,9 @@ public:
             auto input1_trans_pshape =
                 (primitive->input1_transpose_order != default_order) ? transpose_pshape(input1_pshape, primitive->input1_transpose_order) : input1_pshape;
             for (size_t i = 0; i < max_rank - 2; ++i) {
-                if (input0_trans_pshape[i].is_static() && input1_trans_pshape[i].is_static()) {
+                // An empty batch (e.g. a 0-row step) broadcasts nothing, and would divide by zero below.
+                if (input0_trans_pshape[i].is_static() && input1_trans_pshape[i].is_static() &&
+                    input0_trans_pshape[i].get_length() != 0 && input1_trans_pshape[i].get_length() != 0) {
                     if (input1_trans_pshape[i].get_length() > input0_trans_pshape[i].get_length()) {
                         params.input0_reshape_axes = primitive->input0_transpose_order[i];
                         params.input0_broadcast_val = input1_trans_pshape[i].get_length() / input0_trans_pshape[i].get_length();
