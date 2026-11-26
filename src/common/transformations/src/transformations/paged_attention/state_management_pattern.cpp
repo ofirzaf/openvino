@@ -27,6 +27,7 @@
 #include "openvino/op/less.hpp"
 #include "openvino/op/less_eq.hpp"
 #include "openvino/op/logical_or.hpp"
+#include "openvino/op/clamp.hpp"
 #include "openvino/op/maximum.hpp"
 #include "openvino/op/minimum.hpp"
 #include "openvino/op/multiply.hpp"
@@ -265,8 +266,9 @@ static std::tuple<std::shared_ptr<ov::Node>, std::shared_ptr<ov::Node>> gemma4_s
 // of bias values over the backward distance to the key, [batch, num_heads, query_len, extent], and the bias is
 //   Add(mask, Select(distance < 0 || distance >= extent, 0, GatherElements(table, clamp(distance, 0, extent - 1))))
 // PagedAttention takes the table as is (alibi_slopes input of rank 3) and applies the distance itself.
+// An IR with compressed (f16) constants has the clamp as one Clamp op and the zero behind a Convert; both forms match.
 struct RelativeBiasTablePattern {
-    std::shared_ptr<ov::Node> table, distance, lower_bound, upper_bound, clamp_min, clamp_max, zero, gather, mask;
+    std::shared_ptr<ov::Node> table, distance, lower_bound, upper_bound, clamp_min, clamp_max, clamp, zero, gather, mask;
 
     explicit RelativeBiasTablePattern(const std::shared_ptr<ov::Node>& inner_mask) {
         distance = any_input();
@@ -278,15 +280,17 @@ struct RelativeBiasTablePattern {
 
         clamp_min = wrap_type<v0::Constant>();
         clamp_max = wrap_type<v0::Constant>();
-        auto index = wrap_type<v1::Maximum>({distance, clamp_min});
+        std::shared_ptr<ov::Node> index = wrap_type<v1::Maximum>({distance, clamp_min});
         index = wrap_type<v1::Minimum>({index, clamp_max});
+        clamp = wrap_type<v0::Clamp>({distance});
+        index = std::make_shared<Or>(OutputVector{index, clamp});
         index = pattern::optional<ov::op::util::BroadcastBase>({index, any_input()});
         index = pattern::optional<v0::Convert>(index);
 
         table = any_input(pattern::rank_equals(4));
         gather = wrap_type<v6::GatherElements>({table, index});
         zero = wrap_type<v0::Constant>();
-        auto bias = wrap_type<v1::Select>({out_of_range, zero, gather});
+        auto bias = wrap_type<v1::Select>({out_of_range, pattern::optional<v0::Convert>(zero), gather});
         mask = wrap_type<v1::Add>({inner_mask, bias});
     }
 
@@ -309,7 +313,15 @@ struct RelativeBiasTablePattern {
         const auto axis = gather_node->get_axis();
         const auto extent = static_cast<double>(table_shape[3].get_length());
         const auto lower = scalar(lower_bound), upper = scalar(upper_bound), fill = scalar(zero);
-        const auto min = scalar(clamp_min), max = scalar(clamp_max);
+        std::optional<double> min, max;
+        if (pattern_map.count(clamp)) {
+            const auto clamp_node = ov::as_type_ptr<v0::Clamp>(pattern_map.at(clamp).get_node_shared_ptr());
+            min = clamp_node->get_min();
+            max = clamp_node->get_max();
+        } else {
+            min = scalar(clamp_min);
+            max = scalar(clamp_max);
+        }
         if ((axis != 3 && axis != -1) || !lower || !upper || !fill || !min || !max) {
             return nullptr;
         }

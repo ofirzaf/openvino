@@ -8322,6 +8322,9 @@ struct Config {
     int64_t sliding_window = 0;  // 0: full attention
     int64_t extent = 12;
     int64_t upper_bound = 12;  // != extent: the Select does not zero the bias exactly outside of the table
+    // The form of an IR saved with compressed (f16) constants: float constants behind a Convert, and the clamp of
+    // the distance as one Clamp op
+    bool compressed_constants = false;
 };
 
 constexpr int64_t num_heads = 4;
@@ -8428,12 +8431,20 @@ std::shared_ptr<ov::Model> make_model(const Config& config) {
     auto out_of_range = makeOP<v13::BitwiseOr>({makeOP<v1::Less>({distance_4d, zero}, {{"auto_broadcast", "numpy"}}),
                                                 makeOP<v1::GreaterEqual>({distance_4d, upper}, {{"auto_broadcast", "numpy"}})},
                                                {{"auto_broadcast", "numpy"}});
-    auto index = makeOP<v1::Minimum>({makeOP<v1::Maximum>({distance_4d, zero}, {{"auto_broadcast", "numpy"}}), last},
-                                     {{"auto_broadcast", "numpy"}});
+    std::shared_ptr<Node> index;
+    std::shared_ptr<Node> zero_fill;
+    if (config.compressed_constants) {
+        index = makeOP<v0::Clamp>({distance_4d}, {{"min", 0.0}, {"max", static_cast<double>(config.extent - 1)}});
+        zero_fill = makeOP<v0::Convert>({makeConst(element::f16, ov::Shape{}, std::vector<float>{0.0f})}, {{"destination_type", "f32"}});
+    } else {
+        index = makeOP<v1::Minimum>({makeOP<v1::Maximum>({distance_4d, zero}, {{"auto_broadcast", "numpy"}}), last},
+                                    {{"auto_broadcast", "numpy"}});
+        zero_fill = makeConst(element::f32, ov::Shape{}, std::vector<float>{0.0f});
+    }
     auto index_shape = makeOP<v0::Concat>({batch_dim, i64_const({num_heads}), {1l}, {1l}}, {{"axis", 0}});
     index = makeOP<v0::Convert>({makeOP<v3::Broadcast>({index, index_shape}, {{"mode", "bidirectional"}})},
                                 {{"destination_type", "i32"}});
-    auto bias = makeOP<v1::Select>({out_of_range, 0.0f, makeOP<v6::GatherElements>({table, index}, {{"axis", 3}})},
+    auto bias = makeOP<v1::Select>({out_of_range, zero_fill, makeOP<v6::GatherElements>({table, index}, {{"axis", 3}})},
                                    {{"auto_broadcast", "numpy"}});
     auto mask_with_bias = makeOP<v1::Add>({mask, bias}, {{"auto_broadcast", "numpy"}});
 
@@ -8465,12 +8476,14 @@ int64_t get_sliding_window(const std::shared_ptr<ov::op::PagedAttentionExtension
 }
 }  // namespace inkling2_pattern
 
-class SDPAToPAInkling2Test : public testing::TestWithParam<int64_t> {};
+// sliding window (0: full attention), IR with compressed constants
+class SDPAToPAInkling2Test : public testing::TestWithParam<std::tuple<int64_t, bool>> {};
 
 TEST_P(SDPAToPAInkling2Test, SDPAToPA_Inkling2_RelativeBiasTableAndPerTokenSinks) {
     using namespace inkling2_pattern;
     Config config;
-    config.sliding_window = GetParam();
+    config.sliding_window = std::get<0>(GetParam());
+    config.compressed_constants = std::get<1>(GetParam());
     // the bias extent of a sliding layer is its window
     config.extent = config.upper_bound = config.sliding_window > 0 ? config.sliding_window : 12;
     auto model = make_model(config);
@@ -8500,7 +8513,7 @@ TEST_P(SDPAToPAInkling2Test, SDPAToPA_Inkling2_RelativeBiasTableAndPerTokenSinks
     EXPECT_EQ(get_sliding_window(pa), config.sliding_window);
 }
 
-INSTANTIATE_TEST_SUITE_P(SDPAToPA, SDPAToPAInkling2Test, testing::Values(int64_t{0}, int64_t{8}));
+INSTANTIATE_TEST_SUITE_P(SDPAToPA, SDPAToPAInkling2Test, testing::Combine(testing::Values(int64_t{0}, int64_t{8}), testing::Bool()));
 
 TEST(SDPAToPA, SDPAToPA_Inkling2_BiasNotZeroOutsideOfTableIsNotConverted) {
     using namespace inkling2_pattern;
