@@ -123,6 +123,13 @@ struct PagedAttentionManager {
 
     std::vector<ov::float16> sinks;
 
+    // Relative position bias table (input 11 as [tokens, num_heads, extent]): a row of bias values per scheduled
+    // token and head, indexed by the backward distance to the key. 0: no table.
+    int bias_table_extent = 0;
+    std::vector<ov::float16> bias_table;
+    // Sinks as [tokens, num_heads, 1, 1]: one value per scheduled token and head
+    bool per_token_sinks = false;
+
     int adaptive_rkv_start_size = 0;
     std::vector<int> adaptive_rkv_evictable_sizes;
     std::vector<int> adaptive_rkv_diversity_block_set_indices;
@@ -737,7 +744,57 @@ struct PagedAttentionManager {
         return get_memory_from_vec(sliding_window);
     }
 
+    // Fills the relative bias table and/or the per-token sinks with random values.
+    // Every table row has a few large entries (at row-dependent distances, one to about four per row, spread
+    // over the whole extent), and the sink is about as large as the rest of the softmax denominator: above it for
+    // every second head and token, below it for the others. So, whatever the context length, a few keys and the
+    // sink carry most of the weight, and a kernel that reads the table or the sinks at a wrong place is far off.
+    void init_relative_bias(int extent, bool sinks_per_token) {
+        const size_t total_tokens = static_cast<size_t>(subsequence_begins.back());
+        std::mt19937 gen(4321);
+        std::uniform_real_distribution<float> bias_dist(-2.0f, 2.0f);
+        std::uniform_real_distribution<float> sink_dist(-0.5f, 0.5f);
+        const size_t large_entry_period = static_cast<size_t>(std::max(1, std::min(extent, std::max(37, extent / 4))));
+        bias_table_extent = extent;
+        bias_table.resize(total_tokens * num_heads * extent);
+        per_token_sinks = sinks_per_token;
+        if (sinks_per_token) {
+            sinks.resize(total_tokens * num_heads);
+        }
+        for (size_t i = 0; i < subsequence_descs.size(); i++) {
+            for (int q = 0; q < subsequence_descs[i].num_tokens; q++) {
+                const size_t token = static_cast<size_t>(subsequence_begins[i] + q);
+                int visible_keys = subsequence_descs[i].past_len + q + 1;
+                if (sliding_window_size > 0) {
+                    visible_keys = std::min(visible_keys, sliding_window_size);
+                }
+                for (int h = 0; h < num_heads; h++) {
+                    const size_t row = token * num_heads + h;
+                    // keys outside of the table have a bias of 0 and scores close to 0
+                    double denominator = std::max(0, visible_keys - extent);
+                    for (int distance = 0; distance < extent; distance++) {
+                        const float value = bias_dist(gen) + (distance % large_entry_period == (5 + 7 * row) % large_entry_period ? 8.0f : 0.0f);
+                        bias_table[row * extent + distance] = ov::float16(value);
+                        if (distance < visible_keys) {
+                            denominator += std::exp(value);
+                        }
+                    }
+                    if (sinks_per_token) {
+                        const float side = (token + h) % 2 == 0 ? 1.5f : -1.5f;
+                        sinks[row] = ov::float16(static_cast<float>(std::log(denominator)) + side + sink_dist(gen));
+                    }
+                }
+            }
+        }
+    }
+
     cldnn::memory::ptr get_alibi_memory() {
+        if (bias_table_extent > 0) {
+            auto mem = get_memory_from_vec(bias_table);
+            auto layout = mem->get_layout();
+            layout.set_partial_shape(ov::PartialShape{static_cast<int64_t>(subsequence_begins.back()), num_heads, bias_table_extent});
+            return test_engine.reinterpret_buffer(*mem, layout);
+        }
         std::vector<ov::float16> alibi;
         return get_memory_from_vec(alibi);
     }
@@ -792,7 +849,7 @@ struct PagedAttentionManager {
     cldnn::memory::ptr get_sinks_memory() {
         auto mem = get_memory_from_vec(sinks);
         auto layout = mem->get_layout();
-        layout.set_partial_shape(ov::PartialShape{1, num_heads, 1, 1});
+        layout.set_partial_shape(ov::PartialShape{per_token_sinks ? static_cast<int64_t>(subsequence_begins.back()) : int64_t{1}, num_heads, 1, 1});
 
         if (sinks.empty()) {
             auto empty_layout = mem->get_layout();
@@ -1106,6 +1163,12 @@ struct PagedAttentionReference {
                 }
             }
 
+            if (pam.bias_table_extent > 0 || pam.per_token_sinks) {
+                const auto host_ref = run_host_reference(pam.query_data[i], key_data, pam.value_data[i], subsequence_desc.num_tokens, kv_seq_len, pam.subsequence_begins[i]);
+                ref_data_output.insert(ref_data_output.end(), host_ref.begin(), host_ref.end());
+                continue;
+            }
+
             auto subsequence_ref_results = run_reference(has_xattention,
                                                          pam.query_data[i],
                                                          key_data,
@@ -1136,6 +1199,67 @@ struct PagedAttentionReference {
     }
 
 private:
+    // Plain host reference for the relative bias table and the sinks (no scores output):
+    //   weights = softmax over the keys in the causal (and sliding) window of
+    //             score * scale + bias_table[token, head, query position - key position]   (inside the table only)
+    //   with the sink logit of the query token and head added to the denominator.
+    // Layouts: query [num_queries, num_heads, k_head_size], key and value [num_keys, num_kv_heads, head_size],
+    // output [num_queries, num_heads, v_head_size]. `first_token` is the row of the first query in the table and sinks.
+    std::vector<ov::float16> run_host_reference(const std::vector<ov::float16>& query_data,
+                                                const std::vector<ov::float16>& key_data,
+                                                const std::vector<ov::float16>& value_data,
+                                                int num_queries,
+                                                int num_keys,
+                                                int first_token) {
+        const int num_heads = pam.num_heads, num_kv_heads = pam.num_kv_heads, group_size = num_heads / num_kv_heads;
+        const int k_head_size = pam.k_head_size, v_head_size = pam.v_head_size;
+        const int past_len = num_keys - num_queries, extent = pam.bias_table_extent, window = pam.sliding_window_size;
+        const double scale = pam.get_default_scale();
+        std::vector<ov::float16> output(static_cast<size_t>(num_queries) * num_heads * v_head_size);
+        std::vector<double> scores(num_keys);
+        for (int q = 0; q < num_queries; q++) {
+            const int q_pos = past_len + q;
+            const int first_key = window > 0 ? std::max(0, q_pos - window + 1) : 0;
+            const size_t token = static_cast<size_t>(first_token + q);
+            for (int h = 0; h < num_heads; h++) {
+                const int kv_h = h / group_size;
+                const ov::float16* query = &query_data[(static_cast<size_t>(q) * num_heads + h) * k_head_size];
+                double max_score = -std::numeric_limits<double>::infinity();
+                for (int k = first_key; k <= q_pos; k++) {
+                    const ov::float16* key = &key_data[(static_cast<size_t>(k) * num_kv_heads + kv_h) * k_head_size];
+                    double score = 0.0;
+                    for (int d = 0; d < k_head_size; d++) {
+                        score += static_cast<double>(static_cast<float>(query[d])) * static_cast<float>(key[d]);
+                    }
+                    score *= scale;
+                    if (q_pos - k < extent) {
+                        score += static_cast<float>(pam.bias_table[(token * num_heads + h) * extent + (q_pos - k)]);
+                    }
+                    scores[k] = score;
+                    max_score = std::max(max_score, score);
+                }
+                double denominator = 0.0;
+                if (!pam.sinks.empty()) {
+                    const double sink = static_cast<float>(pam.per_token_sinks ? pam.sinks[token * num_heads + h] : pam.sinks[h]);
+                    max_score = std::max(max_score, sink);
+                    denominator += std::exp(sink - max_score);
+                }
+                for (int k = first_key; k <= q_pos; k++) {
+                    scores[k] = std::exp(scores[k] - max_score);
+                    denominator += scores[k];
+                }
+                for (int d = 0; d < v_head_size; d++) {
+                    double value = 0.0;
+                    for (int k = first_key; k <= q_pos; k++) {
+                        value += scores[k] * static_cast<float>(value_data[(static_cast<size_t>(k) * num_kv_heads + kv_h) * v_head_size + d]);
+                    }
+                    output[(static_cast<size_t>(q) * num_heads + h) * v_head_size + d] = ov::float16(static_cast<float>(value / denominator));
+                }
+            }
+        }
+        return output;
+    }
+
     std::pair<std::vector<ov::float16>, std::vector<ov::float16>> run_reference(bool has_xattention,
                                                                                 const std::vector<ov::float16>& query_data,
                                                                                 const std::vector<ov::float16>& key_data,
@@ -1935,6 +2059,10 @@ public:
             pam.sinks = p.sink_values.value();
         }
 
+        if (p.bias_table_extent > 0 || p.per_token_sinks) {
+            pam.init_relative_bias(p.bias_table_extent, p.per_token_sinks);
+        }
+
         if (p.kv_cache_compression) {
             // INT4 quantization has larger error than INT8 (~17x larger step size)
             tolerance = (kv_cache_precision == ov::element::u4 || kv_cache_precision == ov::element::i4) ? 75e-3 : 25e-3;
@@ -2040,6 +2168,13 @@ public:
         adaptive_rkv_diversity_block_set_indices_begins_layout.set_partial_shape(ov::PartialShape{-1});
         qq_bias_layout.set_partial_shape(ov::PartialShape{-1});
         qq_bias_begins_layout.set_partial_shape(ov::PartialShape{-1});
+        // one row per scheduled token, like in a converted model
+        if (p.bias_table_extent > 0) {
+            alibi_layout.set_partial_shape(ov::PartialShape{-1, p.num_heads, p.bias_table_extent});
+        }
+        if (p.per_token_sinks) {
+            sinks_layout.set_partial_shape(ov::PartialShape{-1, p.num_heads, 1, 1});
+        }
 
         if (p.dynamic_paddings) {
             const auto padding_axis = 1;
@@ -2108,8 +2243,10 @@ public:
         pa_prim.heads_num = p.num_heads;
         pa_prim.scale_val = pam.get_default_scale();
         pa_prim.has_alibi = false;
-        pa_prim.has_token_type_ids = p.token_type_ids.has_value() || p.has_sink_input;
-        pa_prim.has_sink_input = p.has_sink_input;
+        pa_prim.has_token_type_ids = p.token_type_ids.has_value() || (p.has_sink_input && !p.per_token_sinks);
+        pa_prim.has_sink_input = p.has_sink_input || p.per_token_sinks;
+        pa_prim.bias_table_extent = static_cast<size_t>(p.bias_table_extent);
+        pa_prim.has_per_token_sinks = p.per_token_sinks;
 
         int num_outputs = 1;
         if (p.scores_mode != ScoresMode::DISABLED)
@@ -2186,6 +2323,9 @@ public:
         config.set_property(ov::internal::key_cache_quant_mode(p.key_cache_quant_mode));
         if (kv_cache_precision != ov::element::dynamic) {
             config.set_property(ov::hint::kv_cache_precision(kv_cache_precision));
+        }
+        if (!p.enable_sdpa_micro) {
+            config.set_property(ov::intel_gpu::enable_sdpa_micro(false));
         }
         cldnn::network::ptr network = tests::get_network(tests::get_test_engine(), topology, config, tests::get_test_stream_ptr(), false);
         network->set_input_data("query", query_mem);
@@ -3008,6 +3148,13 @@ struct paged_attention_test_params {
 
     // Replaces generated Key inputs with zeros and validates BY_CHANNEL cache scales.
     bool zero_key_data = false;
+
+    // Relative position bias table: input 11 as [tokens, num_heads, extent] with random values. 0: no table.
+    int bias_table_extent = 0;
+    // Sinks as [tokens, num_heads, 1, 1] with random values (enables the sink input)
+    bool per_token_sinks = false;
+    // false: prefill and mixed calls take the sdpa_opt.cl fallback instead of the micro SDPA kernel
+    bool enable_sdpa_micro = true;
 };
 
 const auto ENABLE_CACHE_COMPRESSION = true;

@@ -372,6 +372,142 @@ INSTANTIATE_TEST_SUITE_P(smoke_paged_attention_sink_v2_effect, paged_attention_s
     paged_attention_test_params{ {{64, 0}}, 8, 2, 64, 64, 16, 0, DISABLE_CACHE_COMPRESSION, ov::internal::CacheQuantMode::BY_TOKEN, STATIC_INPUT_PAD, DISABLE_SCORES, DISABLE_ROTATION, ENABLE_FA_V2, false, 0, {}, false },
 }));
 
+// Relative position bias table (input 11 as [tokens, heads, extent]) and per-token sinks ([tokens, heads, 1, 1]),
+// checked against a host reference. Each case runs with micro SDPA on and off, so the prefill and mixed calls go
+// through sdpa_micro.cl and through the sdpa_opt.cl fallback (both of its softmax variants).
+class paged_attention_bias_table_test : public PagedAttentionTest<paged_attention_test_params> {};
+
+TEST_P(paged_attention_bias_table_test, matches_host_reference) {
+    auto p = GetParam();
+    // f16 kernels against a double precision reference: measured errors are up to 3e-4
+    tolerance = 1e-3f;
+    execute(p);
+    if (HasFatalFailure()) {
+        return;
+    }
+
+    // The case must be able to fail. A kernel that read the table or the sinks at a wrong place would produce one
+    // of the outputs below; each must be far from the GPU output (which matched the right reference above).
+    const auto output = get_output_data();
+    const auto distance_to_reference = [&]() {
+        const auto reference = std::get<0>(PagedAttentionReference(*pam).get_reference());
+        float distance = 0.0f;
+        for (size_t i = 0; i < output.size(); i++) {
+            distance = std::max(distance, std::abs(static_cast<float>(output[i]) - static_cast<float>(reference[i])));
+        }
+        return distance;
+    };
+    const size_t num_heads = static_cast<size_t>(p.num_heads);
+    const float min_distance = 10 * tolerance;
+    if (p.bias_table_extent > 0) {
+        const auto table = pam->bias_table;
+        const size_t extent = static_cast<size_t>(p.bias_table_extent);
+
+        std::fill(pam->bias_table.begin(), pam->bias_table.end(), ov::float16(0.0f));
+        EXPECT_GT(distance_to_reference(), min_distance) << "no table";
+
+        for (size_t i = 0; i < table.size(); i++) {  // distance off by one
+            pam->bias_table[i] = table[i - i % extent + (i % extent + 1) % extent];
+        }
+        EXPECT_GT(distance_to_reference(), min_distance) << "distance off by one";
+
+        for (size_t i = 0; i < table.size(); i++) {  // row of the next head
+            pam->bias_table[i] = table[(i + extent) % table.size()];
+        }
+        EXPECT_GT(distance_to_reference(), min_distance) << "table row of another head";
+
+        if (table.size() > num_heads * extent) {  // row of the next token
+            for (size_t i = 0; i < table.size(); i++) {
+                pam->bias_table[i] = table[(i + num_heads * extent) % table.size()];
+            }
+            EXPECT_GT(distance_to_reference(), min_distance) << "table row of another token";
+        }
+        pam->bias_table = table;
+    }
+    if (p.per_token_sinks) {
+        const auto sinks = pam->sinks;
+
+        std::fill(pam->sinks.begin(), pam->sinks.end(), ov::float16(-30.0f));
+        EXPECT_GT(distance_to_reference(), min_distance) << "no sinks";
+
+        for (size_t i = 0; i < sinks.size(); i++) {  // sink of the next head
+            pam->sinks[i] = sinks[(i + 1) % sinks.size()];
+        }
+        EXPECT_GT(distance_to_reference(), min_distance) << "sink of another head";
+
+        if (sinks.size() > num_heads) {  // sink of the next token
+            for (size_t i = 0; i < sinks.size(); i++) {
+                pam->sinks[i] = sinks[(i + num_heads) % sinks.size()];
+            }
+            EXPECT_GT(distance_to_reference(), min_distance) << "sink of another token";
+        }
+        pam->sinks = sinks;
+    }
+}
+
+static std::vector<paged_attention_test_params> make_bias_table_params() {
+    struct Case {
+        std::vector<SubsequenceDescriptor> subsequences;
+        int num_heads, num_kv_heads, head_size, sliding_window, extent;
+        bool per_token_sinks;
+    };
+    const std::vector<Case> cases = {
+        // prefill
+        {{{37, 0}}, 4, 2, 64, 0, 12, true},
+        {{{300, 0}}, 4, 2, 64, 0, 12, true},
+        {{{300, 0}}, 4, 2, 64, 8, 8, true},        // sliding layer: the extent is the window
+        {{{1100, 0}}, 6, 2, 128, 0, 1024, true},   // extent close to the context, 3 heads per KV head
+        {{{20, 0}}, 4, 2, 64, 0, 64, true},        // table longer than the context
+        {{{130, 0}, {37, 0}}, 4, 2, 64, 0, 12, true},
+        {{{300, 0}}, 4, 4, 64, 0, 12, true},       // no GQA
+        {{{300, 0}}, 4, 2, 64, 0, 12, false},      // table without sinks
+        {{{300, 0}}, 4, 2, 64, 0, 0, true},        // per-token sinks without table
+        // single tokens
+        {{{1, 40}}, 4, 2, 64, 0, 12, true},
+        {{{1, 300}}, 4, 2, 64, 8, 8, true},
+        {{{1, 300}}, 4, 4, 64, 0, 12, true},
+        {{{1, 5}, {1, 300}, {1, 77}}, 4, 2, 64, 0, 12, true},
+        {{{1, 4200}}, 4, 2, 64, 0, 12, true},      // GQA single-token kernel (context of 4096 and more)
+        {{{1, 4200}}, 6, 2, 128, 0, 1024, true},
+        {{{1, 4200}}, 4, 2, 64, 8, 8, true},
+        // several new tokens after a past (mixed)
+        {{{20, 30}}, 4, 2, 64, 0, 12, true},
+        {{{130, 150}}, 4, 2, 64, 0, 12, true},
+        {{{130, 150}}, 4, 2, 64, 8, 8, true},
+        {{{130, 150}}, 4, 4, 64, 0, 12, true},
+        {{{130, 150}}, 4, 2, 64, 0, 12, false},
+        {{{10, 0}, {1, 34}, {25, 10}}, 4, 2, 64, 0, 12, true},
+        {{{3, 500}, {40, 7}}, 4, 2, 64, 8, 8, true},
+    };
+    std::vector<paged_attention_test_params> params;
+    for (const auto& c : cases) {
+        // micro SDPA, then the sdpa_opt.cl fallback in its two variants (FlashAttention v2 and v1)
+        const std::vector<std::pair<bool, bool>> kernels = {{true, ENABLE_FA_V2}, {false, ENABLE_FA_V2}, {false, DISABLE_FA_V2}};
+        for (const auto& [micro, fa_v2] : kernels) {
+            paged_attention_test_params p{c.subsequences,
+                                          c.num_heads,
+                                          c.num_kv_heads,
+                                          c.head_size,
+                                          c.head_size,
+                                          16,
+                                          c.sliding_window,
+                                          DISABLE_CACHE_COMPRESSION,
+                                          ov::internal::CacheQuantMode::BY_TOKEN,
+                                          STATIC_INPUT_PAD,
+                                          DISABLE_SCORES,
+                                          DISABLE_ROTATION,
+                                          fa_v2};
+            p.bias_table_extent = c.extent;
+            p.per_token_sinks = c.per_token_sinks;
+            p.enable_sdpa_micro = micro;
+            params.push_back(p);
+        }
+    }
+    return params;
+}
+
+INSTANTIATE_TEST_SUITE_P(smoke_paged_attention_bias_table, paged_attention_bias_table_test, ::testing::ValuesIn(make_bias_table_params()));
+
 static paged_attention_test_params make_zero_key_regression_params(const ov::element::Type& kv_cache_precision) {
     paged_attention_test_params p{{{32, 0}},
                                   32,

@@ -214,6 +214,9 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
 #ifdef HAS_SINK_INPUT
         const global SINK_DATA_T *sink_ptr,
 #endif
+#if HAS_BIAS_TABLE
+        const global BIAS_TABLE_DATA_T *bias_table,
+#endif
 #if HAS_QQ_BIAS
         const global QQ_BIAS_DATA_T *qq_bias,
         const global QQ_BIAS_BEGINS_DATA_T *qq_bias_begins,
@@ -654,14 +657,24 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
     float masked_scale = sat_mask(iscale * STATIC_SCALAR_ATTN_MASK_VALUE);
 #endif
 #ifdef HAS_SINK_INPUT
-    #if IS_GQA_SINGLE_TOKEN
+    #if SINK_PER_TOKEN
+        /* PagedAttention sinks [tokens, heads, 1, 1]: one value per query token.
+           Column t * SUBGROUP_SIZE + lane of this subgroup's tile is query wg_j0 + sg_j_kq * ugemm_kq_sg_tile_n + column.
+           Columns past the last query are padding: they read the last query's value and their result is dropped. */
+        s_sum_tile_type sink_tile;
+#pragma unroll
+        for (int sink_t = 0; sink_t < ugemm_kq_sg_tile_n / SUBGROUP_SIZE; sink_t++) {
+            const int sink_q = min((int)(wg_j0 + sg_j_kq * ugemm_kq_sg_tile_n) + sink_t * SUBGROUP_SIZE + (int)get_sub_group_local_id(), q - 1);
+            sink_tile.x[0][sink_t] = convert_float(sink_ptr[(subsequence_begin + sink_q) * HEADS_NUM + b0]);
+        }
+    #elif IS_GQA_SINGLE_TOKEN
         int sink_idx = b0 * KV_GROUP_SIZE + get_sub_group_local_id();
         const float sink_val = convert_float(sink_ptr[sink_idx]);
     #else
         const float sink_val = convert_float(sink_ptr[b0]);
     #endif
     #define MULTI_TOKENS_PER_WI ((ugemm_kq_sg_tile_n/SUBGROUP_SIZE) > 1)
-    #if MULTI_TOKENS_PER_WI
+    #if MULTI_TOKENS_PER_WI && !SINK_PER_TOKEN
         #define VEC_SIZE (ugemm_kq_sg_tile_n / SUBGROUP_SIZE)
         typedef float __attribute__((ext_vector_type(VEC_SIZE))) s_sink_vec_type;
         s_sink_vec_type sink_val_vec = sink_val;
@@ -1171,6 +1184,40 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
         tile_elementwise(S_tile, scale);
 #endif
 
+#if HAS_BIAS_TABLE && IS_PAGED_ATTENTION && !IS_GQA_SINGLE_TOKEN
+        /* Relative position bias: bias_table[token, head, distance], distance = query position - key position,
+           added for distances inside the table only. S_tile is scaled already when there is a sink input;
+           otherwise the scale is applied in the exponent later, so the bias is divided by it here (like the mask). */
+        {
+#ifdef LOG_2_E_MUL_SCALE
+    #define BIAS_TABLE_VALUE(x) (convert_float(x) * iscale)
+#else
+    #define BIAS_TABLE_VALUE(x) convert_float(x)
+#endif
+            const int bias_q_begin = (int)(wg_j0 + sg_j0_kq);  /* index among the new tokens */
+            const int bias_k_begin = k0 + sg_i0_kq;            /* key position */
+            const int bias_k_end = bias_k_begin + ugemm_kq_c_type_block1 * ugemm_kq_c_type_nblock1;
+            /* Smallest distance in the tile: first query to last key. Tiles farther than the table get no bias. */
+            if (past_len + bias_q_begin - (bias_k_end - 1) < BIAS_TABLE_EXTENT) {
+                for (int i0 = 0; i0 < ugemm_kq_c_type_block0 * ugemm_kq_c_type_nblock0; i0 += SUBGROUP_SIZE) {
+                    const int bias_q = bias_q_begin + i0 + (int)get_sub_group_local_id();
+                    if (bias_q >= q)
+                        continue;
+                    const global BIAS_TABLE_DATA_T *bias_row = bias_table + ((size_t)(subsequence_begin + bias_q) * HEADS_NUM + b0) * BIAS_TABLE_EXTENT;
+                    const int bias_distance_begin = past_len + bias_q - bias_k_begin;
+                    for (int j = 0; j < ugemm_kq_c_type_block1 * ugemm_kq_c_type_nblock1; j++) {
+                        const uint bias_distance = (uint)(bias_distance_begin - j);
+                        if (bias_distance < BIAS_TABLE_EXTENT) {
+                            tile_access(S_tile, i0, j, SUBGROUP_SIZE, ugemm_kq_c_type_block0,
+                                        ugemm_kq_c_type_block1, ugemm_kq_c_type_nblock0) += BIAS_TABLE_VALUE(bias_row[bias_distance]);
+                        }
+                    }
+                }
+            }
+#undef BIAS_TABLE_VALUE
+        }
+#endif
+
         /* Apply k mask */
 #if REMAINDER_K
         tile_hbroadcast_min(&S_tile, k_mask);
@@ -1334,7 +1381,11 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
         const int cur_k = causal_k - k0 - 1;
         const bool is_last_m_sg = last && (sg_i_kq == cur_k / ugemm_kq_sg_tile_m);
         if (is_last_m_sg) {
-        #if MULTI_TOKENS_PER_WI
+        #if SINK_PER_TOKEN
+#pragma unroll
+            for (int sink_t = 0; sink_t < ugemm_kq_sg_tile_n / SUBGROUP_SIZE; sink_t++)
+                S_max_tile.x[0][sink_t] = fmax(S_max_tile.x[0][sink_t], sink_tile.x[0][sink_t]);
+        #elif MULTI_TOKENS_PER_WI
             #define max_sink(x) (fmax(x, sink_val_vec))
             tile_elementwise(S_max_tile, max_sink);
             #undef max_sink
@@ -1431,8 +1482,12 @@ KERNEL(micro_sdpa)(OPTIONAL_SHAPE_INFO_ARG
         tile_vreduce_add(S_tile, &S_sum_tile1);
 #ifdef HAS_SINK_INPUT
         if (is_last_m_sg){
+        #if SINK_PER_TOKEN
+            s_sum_tile_type sink_minus_max_exp = sink_tile;
+        #else
             s_sum_tile_type sink_minus_max_exp;
             tile_fill(sink_minus_max_exp, convert_float(sink_val));
+        #endif
             #define binary_exp_neg(x, y) native_vexp2(((x) - (y)) * log2_e)
             tile_binary(sink_minus_max_exp, S_max_tile, binary_exp_neg);
             tile_binary(S_sum_tile1, sink_minus_max_exp, binary_add);

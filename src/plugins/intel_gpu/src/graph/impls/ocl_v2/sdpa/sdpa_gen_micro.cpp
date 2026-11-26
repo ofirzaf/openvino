@@ -1103,8 +1103,8 @@ void SDPAMicroGenerator::init_sdpa_configuration(const kernel_impl_params& impl_
         sdpa_config.is_kv_compressed = false;
         sdpa_config.use_asymmetric_quantization = false;
 
-        // PagedAttentionInputIdx::ALIBI
-        const auto has_alibi = impl_param.get_input_layout(11).count() > 0;
+        // PagedAttentionInputIdx::ALIBI: slopes or the relative bias table (a dynamic input, so don't count its elements)
+        const auto has_alibi = desc->has_alibi || desc->has_bias_table();
         const auto has_scale_input = !desc->scale_val.has_value();
         sdpa_config.input_num = 7;
         if (has_scale_input) {
@@ -1246,7 +1246,7 @@ JitConstants SDPAMicroGenerator::get_jit_constants(const kernel_impl_params& par
 
     if (config.is_paged_attention) {
         const auto desc = params.typed_desc<paged_attention>();
-        const auto has_alibi = params.get_input_layout(paged_attention::PagedAttentionInputIdx::ALIBI).count() > 0;
+        const auto has_alibi = desc->has_alibi;
         const auto has_scale_input = !desc->scale_val.has_value();
         const auto has_scores_output = desc->has_scores_output();
         const auto has_qq_bias = desc->has_qq_bias;
@@ -1274,6 +1274,15 @@ JitConstants SDPAMicroGenerator::get_jit_constants(const kernel_impl_params& par
             const auto& sink_layout = params.input_layouts[PagedAttentionInputIdx::SINKS];
             jit.make("SINK_DATA_T", to_ocl_type(sink_layout.data_type));
             jit.make("HAS_SINK_INPUT", 1);
+            if (desc->has_per_token_sinks) {
+                jit.make("SINK_PER_TOKEN", 1);
+            }
+        }
+
+        if (desc->has_bias_table()) {
+            jit.make("HAS_BIAS_TABLE", 1);
+            jit.make("BIAS_TABLE_EXTENT", desc->bias_table_extent);
+            jit.make("BIAS_TABLE_DATA_T", to_ocl_type(params.input_layouts[paged_attention::PagedAttentionInputIdx::ALIBI].data_type));
         }
 
         if (has_qq_bias && !m_is_prefill) {
@@ -1696,6 +1705,9 @@ Arguments SDPAMicroGenerator::get_arguments_desc(const kernel_impl_params& param
 
         if (desc->has_sink_input) {
             args.push_back({ArgumentDescriptor::Types::INPUT, PagedAttentionInputIdx::SINKS});  // sink
+        }
+        if (desc->has_bias_table()) {
+            args.push_back({ArgumentDescriptor::Types::INPUT, PagedAttentionInputIdx::ALIBI});  // relative bias table
         }
 
         if (has_qq_bias && !m_is_prefill) {

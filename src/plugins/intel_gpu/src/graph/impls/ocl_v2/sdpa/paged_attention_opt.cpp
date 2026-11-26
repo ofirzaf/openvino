@@ -1751,11 +1751,6 @@ public:
             return false;
         }
 
-        // TODO: bias table and per-token sinks in the micro kernel
-        if (desc->has_bias_table() || desc->has_per_token_sinks) {
-            return false;
-        }
-
         // Disable micro SDPA for INT4 BY_TOKEN due to accuracy issues
         const auto kv_cache_dt = params.get_program().get_config().get_kv_cache_precision();
         return !data_type_traits::is_i4_u4(kv_cache_dt) || desc->is_key_by_channel;
