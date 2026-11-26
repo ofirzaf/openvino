@@ -80,7 +80,8 @@ PagedAttentionStage get_kv_cache_update_stage(const kernel_impl_params& impl_par
 int64_t get_kv_cache_update_aligned_seq_len(const kernel_impl_params& impl_param,
                                             const KVCacheUpdateInputs& inputs,
                                             const PagedAttentionStage& stage,
-                                            int64_t target_seq_len_block_size) {
+                                            int64_t target_seq_len_block_size,
+                                            bool block_table_fits_rows) {
     // Since at prefill stage Q, K, V inputs may contain multiple sequences with arbitrary
     // target sequence lengths each (shape is [sequences_num * target_seq_len, num_heads * head_size]),
     // to apply blocking to the first dimension (target_seq_len of each sequence), we need to calculate aligned total
@@ -148,7 +149,7 @@ int64_t get_kv_cache_update_aligned_seq_len(const kernel_impl_params& impl_param
 
     int64_t aligned_seq_len = 0;
     if (stage == PagedAttentionStage::PREFILL) {
-        if (static_cast<int64_t>(paged_attention::block_size) == target_seq_len_block_size) {
+        if (block_table_fits_rows && static_cast<int64_t>(paged_attention::block_size) == target_seq_len_block_size) {
             const auto& block_indices_ps = impl_param.get_input_layout(inputs.block_indices).get_partial_shape();
 
             aligned_seq_len = block_indices_ps[0].get_length() * target_seq_len_block_size;

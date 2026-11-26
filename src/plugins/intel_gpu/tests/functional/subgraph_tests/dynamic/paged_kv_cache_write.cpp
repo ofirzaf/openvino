@@ -605,6 +605,9 @@ INSTANTIATE_TEST_SUITE_P(smoke_PagedKVCacheWrite,
                          PagedKVCacheWriteTest,
                          testing::Values(WriteCase{"prefill_with_block", {{0, 37, 16}}},
                                          WriteCase{"long_prefill_with_block", {{0, 1000, 16}}},
+                                         // The writer's block table also covers the block rows: 1025 blocks for
+                                         // 1024 blocks of context rows.
+                                         WriteCase{"prefill_16k_with_block", {{0, 16384, 16}}},
                                          WriteCase{"decode_step", {{100, 5, 16}}},
                                          WriteCase{"unaligned_past", {{37, 3, 8}}},
                                          WriteCase{"batch", {{0, 40, 16}, {64, 7, 16}, {13, 1, 6}}},

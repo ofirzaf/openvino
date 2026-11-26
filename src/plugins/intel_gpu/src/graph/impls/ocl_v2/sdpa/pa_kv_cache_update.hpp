@@ -52,11 +52,16 @@ struct KVCacheUpdateRuntimeParams : public ImplRuntimeParams {
 // rows_input_idx: an input with one row per new token
 PagedAttentionStage get_kv_cache_update_stage(const kernel_impl_params& params, size_t rows_input_idx, size_t past_lens_input_idx);
 
-// Total number of new rows, with the rows of each subsequence aligned to target_seq_len_block_size
+// Total number of new rows, with the rows of each subsequence aligned to target_seq_len_block_size.
+// block_table_fits_rows: in the prefill stage the block table holds exactly the blocks of the new rows, so the total
+// follows from its length without reading subsequence_begins. Not the case for paged_kv_cache_write, whose block
+// table also covers the rows that PagedAttention writes after it; a longer table would dispatch work groups for
+// blocks that have no rows.
 int64_t get_kv_cache_update_aligned_seq_len(const kernel_impl_params& params,
                                             const KVCacheUpdateInputs& inputs,
                                             const PagedAttentionStage& stage,
-                                            int64_t target_seq_len_block_size = 16);
+                                            int64_t target_seq_len_block_size = 16,
+                                            bool block_table_fits_rows = true);
 
 size_t get_num_k_head_size_partitions(bool is_key_by_channel, int64_t k_head_size);
 

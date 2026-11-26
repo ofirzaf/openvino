@@ -47,7 +47,8 @@ public:
         rt_params->stage = get_kv_cache_update_stage(params, InputIdx::KEY, InputIdx::PAST_LENS);
         if ((rt_params->stage == PagedAttentionStage::PREFILL || rt_params->stage == PagedAttentionStage::MIXED) && !params.is_dynamic()) {
             const auto inputs = get_kv_cache_update_desc(params).inputs;
-            rt_params->paged_attention_aligned_seq_len = static_cast<size_t>(get_kv_cache_update_aligned_seq_len(params, inputs, rt_params->stage));
+            rt_params->paged_attention_aligned_seq_len = static_cast<size_t>(
+                get_kv_cache_update_aligned_seq_len(params, inputs, rt_params->stage, 16, /*block_table_fits_rows=*/false));
         }
     }
 
@@ -74,9 +75,10 @@ public:
         return execute_stage(events, instance, kv_cache_update);
     }
 
-    // The rows to write may change (MIXED stage) even if the input shapes haven't been changed
+    // The work groups follow the rows of each sequence (subsequence_begins, and past_lens in the MIXED stage), which
+    // may change even if the input shapes haven't been changed
     bool requires_update(primitive_inst& inst, const kernel_impl_params& impl_params) const override {
-        return get_kv_cache_update_stage(impl_params, InputIdx::KEY, InputIdx::PAST_LENS) == PagedAttentionStage::MIXED;
+        return get_kv_cache_update_stage(impl_params, InputIdx::KEY, InputIdx::PAST_LENS) != PagedAttentionStage::GENERATE;
     }
 
     [[nodiscard]] std::vector<BufferDescriptor> get_internal_buffer_descs(const kernel_impl_params& params) const override {
@@ -88,7 +90,8 @@ public:
         int64_t aligned_seq_len = -1;
         if (!params.is_dynamic()) {
             const auto stage = get_kv_cache_update_stage(params, InputIdx::KEY, InputIdx::PAST_LENS);
-            aligned_seq_len = get_kv_cache_update_aligned_seq_len(params, get_kv_cache_update_desc(params).inputs, stage);
+            aligned_seq_len = get_kv_cache_update_aligned_seq_len(params, get_kv_cache_update_desc(params).inputs, stage,
+                                                                  target_seq_len_block_size, /*block_table_fits_rows=*/false);
         }
         const auto target_seq_len = std::max<int64_t>(aligned_seq_len, 1);
         const auto indexes_buf_size = static_cast<int64_t>(ceil_div(target_seq_len, target_seq_len_block_size)) * element_size;
