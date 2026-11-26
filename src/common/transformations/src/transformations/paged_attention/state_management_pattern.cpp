@@ -316,8 +316,10 @@ struct RelativeBiasTablePattern {
         if (*lower != 0 || *upper != extent || *fill != 0 || *min != 0 || *max != extent - 1) {
             return nullptr;
         }
-        // In the PagedAttention form every token is a batch element with a query length of 1
-        return std::make_shared<v1::Reshape>(table_out, v0::Constant::create(ov::element::i64, ov::Shape{3}, {0, 0, -1}), true);
+        // In the PagedAttention form every token is a batch element with a query length of 1.
+        // The extent is written out, so that it stays static when shape inference does not know the query length.
+        const auto target_shape = v0::Constant::create(ov::element::i64, ov::Shape{3}, {int64_t{-1}, int64_t{0}, table_shape[3].get_length()});
+        return std::make_shared<v1::Reshape>(table_out, target_shape, true);
     }
 };
 
