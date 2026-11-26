@@ -12,8 +12,10 @@
 #include "common_test_utils/node_builders/constant.hpp"
 #include "common_test_utils/ov_test_utils.hpp"
 #include "openvino/core/model.hpp"
+#include "openvino/core/validation_util.hpp"
 #include "openvino/op/abs.hpp"
 #include "openvino/op/add.hpp"
+#include "openvino/op/assign.hpp"
 #include "openvino/op/bitwise_and.hpp"
 #include "openvino/op/bitwise_not.hpp"
 #include "openvino/op/bitwise_or.hpp"
@@ -29,6 +31,7 @@
 #include "openvino/op/fake_convert.hpp"
 #include "openvino/op/fake_quantize.hpp"
 #include "openvino/op/gather.hpp"
+#include "openvino/op/gather_elements.hpp"
 #include "openvino/op/greater.hpp"
 #include "openvino/op/greater_eq.hpp"
 #include "openvino/op/group_conv.hpp"
@@ -47,6 +50,7 @@
 #include "openvino/op/power.hpp"
 #include "openvino/op/qsa_prepare.hpp"
 #include "openvino/op/range.hpp"
+#include "openvino/op/read_value.hpp"
 #include "openvino/op/reduce_mean.hpp"
 #include "openvino/op/reduce_prod.hpp"
 #include "openvino/op/reduce_sum.hpp"
@@ -71,6 +75,7 @@
 #include "openvino/op/util/assign_base.hpp"
 #include "openvino/op/util/variable.hpp"
 #include "openvino/op/variadic_split.hpp"
+#include "transformations/utils/utils.hpp"
 #include "transformations/paged_attention/eliminate_conv_padding_mask_gating.hpp"
 #include "transformations/paged_attention/gemma4_mtp_state_management_pattern.hpp"
 #include "transformations/paged_attention/paged_sparse_attention_fusion.hpp"
@@ -8307,6 +8312,213 @@ INSTANTIATE_TEST_SUITE_P(SDPAToPA,
                          SDPAToPAPagedSparseAttentionTest,
                          ValuesIn(paged_sparse_attention_pattern::cases),
                          PagedSparseAttentionFusionTest::getTestCaseName);
+
+namespace inkling2_pattern {
+// A decoder attention in the form exported for Inkling 2: GQA with a KV cache, a sink per query token and head
+// computed from the hidden state, and a relative position bias per query token added to the mask:
+//   Add(mask, Select(distance < 0 || distance >= extent, 0, GatherElements(table, clamp(distance, 0, extent - 1))))
+// where `table` is [batch, num_heads, query_len, extent].
+struct Config {
+    int64_t sliding_window = 0;  // 0: full attention
+    int64_t extent = 12;
+    int64_t upper_bound = 12;  // != extent: the Select does not zero the bias exactly outside of the table
+};
+
+constexpr int64_t num_heads = 4;
+constexpr int64_t head_size = 16;
+constexpr int64_t hidden_size = 32;
+
+std::shared_ptr<Node> i64_const(const std::vector<int64_t>& values) {
+    return makeConst(element::i64, ov::Shape({values.size()}), values);
+}
+
+std::shared_ptr<ov::Model> make_model(const Config& config) {
+    auto beam_idx = ov::test::utils::make_param(element::i32, PartialShape{DYN}, "beam_idx");
+    auto position_ids = ov::test::utils::make_param(element::i64, PartialShape{DYN, DYN}, "position_ids");
+    auto attention_mask = ov::test::utils::make_param(element::i64, PartialShape{DYN, DYN}, "attention_mask");
+    auto input_ids = ov::test::utils::make_param(element::i64, PartialShape{DYN, DYN}, "input_ids");
+    ParameterVector params{beam_idx, position_ids, attention_mask, input_ids};
+
+    auto ids_shape = makeOP<v3::ShapeOf>({input_ids}, {{"output_type", "i64"}});
+    auto batch_dim = makeOP<v8::Gather>({ids_shape, {0}, 0}, {{"batch_dims", 0}});
+    auto embed_w = makeConst(element::f32, ov::Shape({100, hidden_size}), MOCK_VALUE);
+    auto hidden = makeOP<v8::Gather>({embed_w, makeOP<v0::Convert>({input_ids}, {{"destination_type", "i32"}}), 0},
+                                     {{"batch_dims", 0}});
+    // the log scaling of the model keeps position_ids in use
+    auto positions = makeOP<v0::Convert>({makeOP<v0::Unsqueeze>({position_ids, -1})}, {{"destination_type", "f32"}});
+    hidden = makeOP<v1::Add>({hidden, positions}, {{"auto_broadcast", "numpy"}});
+
+    const auto project = [&](int64_t heads, int64_t size) {
+        auto weights = makeConst(element::f32, ov::Shape({static_cast<size_t>(heads * size), hidden_size}), MOCK_VALUE);
+        auto matmul = makeOP<v0::MatMul>({hidden, weights}, {{"transpose_a", false}, {"transpose_b", true}});
+        auto reshape = makeOP<v1::Reshape>({matmul, i64_const({0, 0, heads, size})}, {{"special_zero", true}});
+        return makeOP<v1::Transpose>({reshape, {0, 2, 1, 3}});
+    };
+    auto Q = project(num_heads, head_size);
+    auto K_cur = project(1, head_size);
+    auto V_cur = project(1, head_size);
+
+    const auto cache = [&](const std::shared_ptr<Node>& current, const std::string& name) {
+        auto init_shape = makeOP<v0::Concat>({batch_dim, {1l}, {0l}, i64_const({head_size})}, {{"axis", 0}});
+        auto read = makeOP<v6::ReadValue>({makeOP<v3::Broadcast>({0.0f, init_shape}, {{"mode", "numpy"}})},
+                                          {{"variable_id", name},
+                                           {"variable_type", "f32"},
+                                           {"variable_shape", PartialShape{DYN, 1, DYN, head_size}}});
+        auto past = makeOP<v8::Gather>({read, beam_idx, 0}, {{"batch_dims", 0}});
+        auto concat = makeOP<v0::Concat>({past, current}, {{"axis", 2}});
+        return std::make_pair(past, concat);
+    };
+    const auto k_cache = cache(K_cur, "k_cache");
+    const auto v_cache = cache(V_cur, "v_cache");
+    const std::shared_ptr<Node> k_past = k_cache.first, k_concat = k_cache.second;
+    const std::shared_ptr<Node> v_past = v_cache.first, v_concat = v_cache.second;
+
+    const auto repeat_kv = [&](const std::shared_ptr<Node>& concat) {
+        auto shape = makeOP<v3::ShapeOf>({concat}, {{"output_type", "i64"}});
+        auto batch_and_heads = makeOP<v8::Gather>({shape, {0, 1}, 0}, {{"batch_dims", 0}});
+        auto len_and_size = makeOP<v8::Gather>({shape, {2, 3}, 0}, {{"batch_dims", 0}});
+        auto target = makeOP<v0::Concat>({batch_and_heads, i64_const({num_heads}), len_and_size}, {{"axis", 0}});
+        auto broadcast = makeOP<v3::Broadcast>({makeOP<v0::Unsqueeze>({concat, 2}), target}, {{"mode", "bidirectional"}});
+        return makeOP<v1::Reshape>({broadcast, i64_const({0, num_heads, -1, head_size})}, {{"special_zero", true}});
+    };
+    auto K = repeat_kv(k_concat);
+    auto V = repeat_kv(v_concat);
+
+    // Positions of the query and key tokens, and their distance [query_len, key_len]
+    auto k_past_shape = makeOP<v3::ShapeOf>({k_past}, {{"output_type", "i64"}});
+    auto past_len = makeOP<v8::Gather>({k_past_shape, 2, 0}, {{"batch_dims", 0}});
+    auto input_ids_shape = makeOP<v3::ShapeOf>({input_ids}, {{"output_type", "i64"}});
+    auto cur_len = makeOP<v8::Gather>({input_ids_shape, 1, 0}, {{"batch_dims", 0}});
+    auto q_pos = makeOP<v4::Range>({past_len, makeOP<v1::Add>({past_len, cur_len}, {{"auto_broadcast", "numpy"}}), 1},
+                                   {{"output_type", "i64"}});
+    auto attention_mask_shape = makeOP<v3::ShapeOf>({attention_mask}, {{"output_type", "i64"}});
+    auto total_len = makeOP<v8::Gather>({attention_mask_shape, 1, 0}, {{"batch_dims", 0}});
+    auto k_pos = makeOP<v4::Range>({0, total_len, 1}, {{"output_type", "i64"}});
+    auto q_pos_col = makeOP<v0::Unsqueeze>({q_pos, 1});
+    auto k_pos_row = makeOP<v0::Unsqueeze>({k_pos, 0});
+    auto distance = makeOP<v1::Subtract>({q_pos_col, k_pos_row}, {{"auto_broadcast", "numpy"}});
+
+    // Causal and padding mask, with the sliding window in the Gemma4 / LFM3 form
+    auto causal = makeOP<v1::LessEqual>({k_pos_row, q_pos_col}, {{"auto_broadcast", "numpy"}});
+    auto padding = makeOP<v0::Convert>({makeOP<v0::Unsqueeze>({makeOP<v0::Unsqueeze>({attention_mask, 1}), 2})},
+                                       {{"destination_type", "boolean"}});
+    auto allowed = makeOP<v13::BitwiseAnd>({makeOP<v0::Unsqueeze>({makeOP<v0::Unsqueeze>({causal, 0}), 1}), padding},
+                                           {{"auto_broadcast", "numpy"}});
+    auto not_allowed = makeOP<v13::BitwiseNot>({allowed});
+    std::shared_ptr<Node> mask;
+    if (config.sliding_window > 0) {
+        auto window = makeConst(element::i64, ov::Shape({1, 1}), std::vector<int64_t>{config.sliding_window});
+        auto out_of_window = makeOP<v1::GreaterEqual>({distance, window}, {{"auto_broadcast", "numpy"}});
+        out_of_window = makeOP<v0::Unsqueeze>({makeOP<v0::Unsqueeze>({out_of_window, 0}), 1});
+        auto window_mask = makeOP<v1::Select>({out_of_window, -65504.0f, 0.0f}, {{"auto_broadcast", "numpy"}});
+        mask = makeOP<v1::Select>({not_allowed, -65504.0f, window_mask}, {{"auto_broadcast", "numpy"}});
+    } else {
+        mask = makeOP<v1::Select>({not_allowed, -65504.0f, 0.0f}, {{"auto_broadcast", "numpy"}});
+    }
+
+    // Relative position bias: every query token has a table over the backward distance
+    auto table_w = makeConst(element::f32, ov::Shape({static_cast<size_t>(num_heads * config.extent), hidden_size}), MOCK_VALUE);
+    auto table = makeOP<v0::MatMul>({hidden, table_w}, {{"transpose_a", false}, {"transpose_b", true}});
+    table = makeOP<v1::Reshape>({table, i64_const({0, 0, num_heads, config.extent})}, {{"special_zero", true}});
+    table = makeOP<v1::Transpose>({table, {0, 2, 1, 3}});
+    auto distance_4d = makeOP<v0::Unsqueeze>({makeOP<v0::Unsqueeze>({distance, 0}), 1});
+    auto zero = makeConst(element::i64, ov::Shape({1, 1, 1, 1}), std::vector<int64_t>{0});
+    auto upper = makeConst(element::i64, ov::Shape({1, 1, 1, 1}), std::vector<int64_t>{config.upper_bound});
+    auto last = makeConst(element::i64, ov::Shape({1, 1, 1, 1}), std::vector<int64_t>{config.extent - 1});
+    auto out_of_range = makeOP<v13::BitwiseOr>({makeOP<v1::Less>({distance_4d, zero}, {{"auto_broadcast", "numpy"}}),
+                                                makeOP<v1::GreaterEqual>({distance_4d, upper}, {{"auto_broadcast", "numpy"}})},
+                                               {{"auto_broadcast", "numpy"}});
+    auto index = makeOP<v1::Minimum>({makeOP<v1::Maximum>({distance_4d, zero}, {{"auto_broadcast", "numpy"}}), last},
+                                     {{"auto_broadcast", "numpy"}});
+    auto index_shape = makeOP<v0::Concat>({batch_dim, i64_const({num_heads}), {1l}, {1l}}, {{"axis", 0}});
+    index = makeOP<v0::Convert>({makeOP<v3::Broadcast>({index, index_shape}, {{"mode", "bidirectional"}})},
+                                {{"destination_type", "i32"}});
+    auto bias = makeOP<v1::Select>({out_of_range, 0.0f, makeOP<v6::GatherElements>({table, index}, {{"axis", 3}})},
+                                   {{"auto_broadcast", "numpy"}});
+    auto mask_with_bias = makeOP<v1::Add>({mask, bias}, {{"auto_broadcast", "numpy"}});
+
+    // A sink per query token and head: [batch, num_heads, query_len, 1]
+    auto sink_w = makeConst(element::f32, ov::Shape({static_cast<size_t>(num_heads), hidden_size}), MOCK_VALUE);
+    auto sinks = makeOP<v0::MatMul>({hidden, sink_w}, {{"transpose_a", false}, {"transpose_b", true}});
+    sinks = makeOP<v0::Unsqueeze>({makeOP<v1::Transpose>({sinks, {0, 2, 1}}), -1});
+
+    auto sdpa = makeOP<v13::ScaledDotProductAttention>({Q, K, V, mask_with_bias, 0.25f, sinks}, {{"causal", false}});
+    ov::SinkVector assigns{
+        std::make_shared<v6::Assign>(k_concat, ov::as_type_ptr<v6::ReadValue>(k_past->get_input_node_shared_ptr(0))->get_variable()),
+        std::make_shared<v6::Assign>(v_concat, ov::as_type_ptr<v6::ReadValue>(v_past->get_input_node_shared_ptr(0))->get_variable())};
+    return std::make_shared<ov::Model>(OutputVector{std::make_shared<v0::Result>(sdpa)}, assigns, params);
+}
+
+std::shared_ptr<ov::op::PagedAttentionExtension> find_paged_attention(const std::shared_ptr<ov::Model>& model) {
+    for (const auto& op : model->get_ordered_ops()) {
+        if (auto node = ov::as_type_ptr<ov::op::PagedAttentionExtension>(op)) {
+            return node;
+        }
+    }
+    return nullptr;
+}
+
+int64_t get_sliding_window(const std::shared_ptr<ov::op::PagedAttentionExtension>& pa) {
+    const auto constant = ov::util::get_constant_from_source(pa->input_value(10));
+    OPENVINO_ASSERT(constant, "sliding_window input of PagedAttention is not foldable to a constant");
+    return constant->cast_vector<int64_t>()[0];
+}
+}  // namespace inkling2_pattern
+
+class SDPAToPAInkling2Test : public testing::TestWithParam<int64_t> {};
+
+TEST_P(SDPAToPAInkling2Test, SDPAToPA_Inkling2_RelativeBiasTableAndPerTokenSinks) {
+    using namespace inkling2_pattern;
+    Config config;
+    config.sliding_window = GetParam();
+    // the bias extent of a sliding layer is its window
+    config.extent = config.upper_bound = config.sliding_window > 0 ? config.sliding_window : 12;
+    auto model = make_model(config);
+
+    ov::pass::Manager pass_manager;
+    pass_manager.register_pass<ov::pass::SDPAToPagedAttention>();
+    pass_manager.run_passes(model);
+
+    const auto pa = find_paged_attention(model);
+    ASSERT_NE(pa, nullptr) << "SDPAToPagedAttention did not produce PagedAttentionExtension";
+    EXPECT_FALSE((ov::op::util::has_op_with_type<v13::ScaledDotProductAttention>(model)));
+    EXPECT_TRUE(model->get_variables().empty() || model->get_sinks().empty());
+
+    // The table is passed as is: one row of bias values per token and head
+    const auto table = pa->input_value(11);
+    EXPECT_EQ(table.get_partial_shape(), (PartialShape{DYN, num_heads, config.extent}));
+    EXPECT_EQ(ov::as_type_ptr<v0::Constant>(table.get_node_shared_ptr()), nullptr) << "the bias table is computed in the model";
+    const auto table_source = table.get_node()->get_input_node_shared_ptr(0);
+    EXPECT_NE(ov::as_type_ptr<v1::Transpose>(table_source), nullptr) << "the table must be the data input of the gather";
+
+    // A sink per token and head
+    const auto sinks = pa->input_value(20);
+    EXPECT_EQ(sinks.get_partial_shape(), (PartialShape{DYN, num_heads, 1, 1}));
+    EXPECT_EQ(ov::as_type_ptr<v0::Constant>(sinks.get_node_shared_ptr()), nullptr);
+
+    // The sliding window of the mask under the bias is kept
+    EXPECT_EQ(get_sliding_window(pa), config.sliding_window);
+}
+
+INSTANTIATE_TEST_SUITE_P(SDPAToPA, SDPAToPAInkling2Test, testing::Values(int64_t{0}, int64_t{8}));
+
+TEST(SDPAToPA, SDPAToPA_Inkling2_BiasNotZeroOutsideOfTableIsNotConverted) {
+    using namespace inkling2_pattern;
+    // The Select keeps the clamped bias for distances 12..15: this is not table[distance] with zero outside, so the
+    // attention must not be converted (a converted attention would silently lose a part of the bias).
+    Config config;
+    config.upper_bound = 16;
+    auto model = make_model(config);
+
+    ov::pass::Manager pass_manager;
+    pass_manager.register_pass<ov::pass::SDPAToPagedAttention>();
+    try {
+        pass_manager.run_passes(model);
+    } catch (const ov::Exception&) {
+        // the rest of the conversion may reject a model whose attention was left as it is
+    }
+    EXPECT_EQ(find_paged_attention(model), nullptr);
+}
 
 /*
 As there's often a need to cover specific model's architecutres in these

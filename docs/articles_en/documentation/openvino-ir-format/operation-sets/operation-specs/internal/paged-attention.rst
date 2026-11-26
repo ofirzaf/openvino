@@ -103,7 +103,7 @@ storage across multiple inference calls.
        block_indices_begins,                    # input  8  [B_seq+1]      i32
        scale,                                   # input  9  []             real
        sliding_window,                          # input 10  []             i32
-       alibi_slopes,                            # input 11  [Hq] or empty  real
+       alibi_slopes,                            # input 11  [Hq] or [T,Hq,R] or empty  real
        max_context_len,                         # input 12  []             i32
        score_aggregation_window,                # input 13  [] or [B_seq]  i32
        rotated_block_indices,                   # input 14  [Nrot] or empty  i32
@@ -112,7 +112,7 @@ storage across multiple inference calls.
        xattention_threshold,                    # input 17  [B_seq] or empty  f16/f32
        xattention_block_size,                   # input 18  []             i32
        xattention_stride,                       # input 19  []             i32
-       sinks,                                   # input 20  [1,Hq,1,1] or empty  real
+       sinks,                                   # input 20  [1,Hq,1,1] or [T,Hq,1,1] or empty  real
        adaptive_rkv_start_size,                 # input 21  []             i32
        adaptive_rkv_evictable_sizes,            # input 22  [B_seq] or empty  i32
        adaptive_rkv_diversity_block_set_indices,         # input 23  [Narkv] or empty  i32
@@ -252,9 +252,13 @@ storage across multiple inference calls.
                        dot = sum(qvec[d] * k_vec[d] for d in range(S))
                        logit = dot * scale_f
 
-                       # ALiBi: linear penalty for distance (always <= 0)
+                       # Position bias: ALiBi, a linear penalty for distance (always <= 0),
+                       # or a table of bias values per query token, head and backward distance
                        if alibi_slopes is not None:
-                           logit += alibi_slopes[h] * (kpos - qpos)
+                           if alibi_slopes.ndim == 1:
+                               logit += alibi_slopes[h] * (kpos - qpos)
+                           elif qpos - kpos < alibi_slopes.shape[2]:
+                               logit += alibi_slopes[token, h, qpos - kpos]
 
                        # Xattention: block-level sparsity from Phase 2.
                        # Mask covers new-to-new attention only; kpos < past is always attended to.
@@ -268,10 +272,13 @@ storage across multiple inference calls.
                        logits.append(logit)
 
                    # Softmax with optional sink.
-                   # The sink is a scalar per head; it augments the softmax
-                   # denominator without producing an output component, so
-                   # all real attention weights are attenuated uniformly.
-                   sink_val = sinks[0, h, 0, 0] if sinks is not None else None
+                   # The sink is a scalar per head, or per query token and head;
+                   # it augments the softmax denominator without producing an
+                   # output component, so all real attention weights are
+                   # attenuated uniformly.
+                   sink_val = None
+                   if sinks is not None:
+                       sink_val = sinks[token if sinks.shape[0] > 1 else 0, h, 0, 0]
                    weights  = softmax_with_optional_sink(logits, sink_val)
 
                    # Weighted sum over value vectors -> output 0
@@ -408,7 +415,11 @@ are used at the time the model is built or compiled.
   distant keys with a linearly increasing negative offset.  In the CPU kernel the ALiBi
   bias is applied only on the non-sliding-window code path; when ``sliding_window > 0``
   the slopes are silently ignored (no error, no bias applied).  See implementation
-  notes.  **Required (always present; empty tensor = disabled).**
+  notes.  A 3D tensor of shape ``[T, Hq, R]`` is a table of bias values instead: query
+  token ``t`` of head ``h`` adds ``table[t, h, query_pos - key_pos]`` to the logit of every
+  key at a backward distance below ``R``, and nothing to the keys further back.  The table
+  form is supported by the GPU plugin only, also together with ``sliding_window``.
+  **Required (always present; empty tensor = disabled).**
 
 * **12**: ``max_context_len`` - scalar tensor of type ``i32``, shape ``[]``.  Hard upper
   bound on the number of attended positions, counting from the current query position backwards.
@@ -456,9 +467,10 @@ are used at the time the model is built or compiled.
 * **19**: ``xattention_stride`` - scalar tensor of type ``i32``, shape ``[]``.  Stride used
   in the strided Q·K importance estimation pass of xattention.  **Required.**
 
-* **20**: ``sinks`` - tensor of type *T*, shape ``[1, Hq, 1, 1]``, or empty (graph
-  validation also accepts rank 1, but the CPU plugin requires rank 4).  Per-query-head
-  sink value.  Participates in the softmax normalization as a virtual ``exp(sink[h])`` term
+* **20**: ``sinks`` - tensor of type *T*, shape ``[1, Hq, 1, 1]`` or ``[T, Hq, 1, 1]``,
+  or empty (graph validation also accepts rank 1, but the CPU plugin requires rank 4).
+  Sink value per query head, or per query token and query head (GPU plugin only).
+  Participates in the softmax normalization as a virtual ``exp(sink[h])`` term
   in the denominator, reducing all real attention weights proportionally.  Does not produce
   a component in the output.  Empty = disabled.  **Required (always present; empty tensor = disabled).**
 

@@ -98,7 +98,9 @@ void PagedAttentionExtension::validate_and_infer_types() {
     input_check(this, 8, "block_indices_begins", {1}, {element::i32});
     input_check(this, 9, "scale", {0}, get_real_types());
     input_check(this, 10, "sliding_window", {0}, {element::i32});
-    input_check(this, 11, "alibi_slopes", {1}, get_real_types());
+    // rank 1: ALiBi slopes [num_heads]; rank 3: a table of bias values per query token, head and backward distance to
+    // the key [batch_size_in_tokens, num_heads, extent], zero for distances outside of [0, extent)
+    input_check(this, 11, "alibi_slopes", {1, 3}, get_real_types());
     input_check(this, 12, "max_context_len", {0}, {element::i32});
     input_check(this, 13, "score_aggregation_window", {0, 1}, {element::i32});
     input_check(this, 14, "rotated_block_indices", {1}, {element::i32});

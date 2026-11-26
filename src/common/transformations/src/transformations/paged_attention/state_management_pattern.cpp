@@ -4,6 +4,7 @@
 
 #include "transformations/paged_attention/state_management_pattern.hpp"
 
+#include <optional>
 #include <tuple>
 #include <unordered_set>
 
@@ -12,6 +13,7 @@
 #include "openvino/op/abs.hpp"
 #include "openvino/op/add.hpp"
 #include "openvino/op/bitwise_and.hpp"
+#include "openvino/op/bitwise_or.hpp"
 #include "openvino/op/broadcast.hpp"
 #include "openvino/op/concat.hpp"
 #include "openvino/op/convert.hpp"
@@ -19,9 +21,14 @@
 #include "openvino/op/fake_convert.hpp"
 #include "openvino/op/fake_quantize.hpp"
 #include "openvino/op/gather.hpp"
+#include "openvino/op/gather_elements.hpp"
 #include "openvino/op/greater.hpp"
 #include "openvino/op/greater_eq.hpp"
+#include "openvino/op/less.hpp"
 #include "openvino/op/less_eq.hpp"
+#include "openvino/op/logical_or.hpp"
+#include "openvino/op/maximum.hpp"
+#include "openvino/op/minimum.hpp"
 #include "openvino/op/multiply.hpp"
 #include "openvino/op/paged_attention.hpp"
 #include "openvino/op/parameter.hpp"
@@ -254,6 +261,66 @@ static std::tuple<std::shared_ptr<ov::Node>, std::shared_ptr<ov::Node>> gemma4_s
     return {mask, offset};
 }
 
+// Per-token relative position bias added to the attention mask (Inkling 2). Every query token has its own table
+// of bias values over the backward distance to the key, [batch, num_heads, query_len, extent], and the bias is
+//   Add(mask, Select(distance < 0 || distance >= extent, 0, GatherElements(table, clamp(distance, 0, extent - 1))))
+// PagedAttention takes the table as is (alibi_slopes input of rank 3) and applies the distance itself.
+struct RelativeBiasTablePattern {
+    std::shared_ptr<ov::Node> table, distance, lower_bound, upper_bound, clamp_min, clamp_max, zero, gather, mask;
+
+    explicit RelativeBiasTablePattern(const std::shared_ptr<ov::Node>& inner_mask) {
+        distance = any_input();
+        lower_bound = wrap_type<v0::Constant>();
+        upper_bound = wrap_type<v0::Constant>();
+        auto below = wrap_type<v1::Less>({distance, lower_bound});
+        auto above = wrap_type<v1::GreaterEqual>({distance, upper_bound});
+        auto out_of_range = wrap_type<v13::BitwiseOr, v1::LogicalOr>({below, above});
+
+        clamp_min = wrap_type<v0::Constant>();
+        clamp_max = wrap_type<v0::Constant>();
+        auto index = wrap_type<v1::Maximum>({distance, clamp_min});
+        index = wrap_type<v1::Minimum>({index, clamp_max});
+        index = pattern::optional<ov::op::util::BroadcastBase>({index, any_input()});
+        index = pattern::optional<v0::Convert>(index);
+
+        table = any_input(pattern::rank_equals(4));
+        gather = wrap_type<v6::GatherElements>({table, index});
+        zero = wrap_type<v0::Constant>();
+        auto bias = wrap_type<v1::Select>({out_of_range, zero, gather});
+        mask = wrap_type<v1::Add>({inner_mask, bias});
+    }
+
+    // The table reshaped to [batch (tokens), num_heads, extent], or nullptr if the matched nodes are not a bias that is
+    // zero outside of 0 <= distance < extent and reads table[..., distance] inside.
+    std::shared_ptr<ov::Node> get_table(const ov::pass::pattern::PatternValueMap& pattern_map) const {
+        const auto scalar = [&](const std::shared_ptr<ov::Node>& node) -> std::optional<double> {
+            const auto constant = ov::as_type_ptr<v0::Constant>(pattern_map.at(node).get_node_shared_ptr());
+            if (!constant || ov::shape_size(constant->get_shape()) != 1) {
+                return std::nullopt;
+            }
+            return constant->cast_vector<double>()[0];
+        };
+        const auto& table_out = pattern_map.at(table);
+        const auto& table_shape = table_out.get_partial_shape();
+        const auto gather_node = ov::as_type_ptr<v6::GatherElements>(pattern_map.at(gather).get_node_shared_ptr());
+        if (!gather_node || !table_shape[3].is_static() || !table_shape[1].is_static()) {
+            return nullptr;
+        }
+        const auto axis = gather_node->get_axis();
+        const auto extent = static_cast<double>(table_shape[3].get_length());
+        const auto lower = scalar(lower_bound), upper = scalar(upper_bound), fill = scalar(zero);
+        const auto min = scalar(clamp_min), max = scalar(clamp_max);
+        if ((axis != 3 && axis != -1) || !lower || !upper || !fill || !min || !max) {
+            return nullptr;
+        }
+        if (*lower != 0 || *upper != extent || *fill != 0 || *min != 0 || *max != extent - 1) {
+            return nullptr;
+        }
+        // In the PagedAttention form every token is a batch element with a query length of 1
+        return std::make_shared<v1::Reshape>(table_out, v0::Constant::create(ov::element::i64, ov::Shape{3}, {0, 0, -1}), true);
+    }
+};
+
 typedef std::
     tuple<std::shared_ptr<ov::Node>, std::shared_ptr<ov::Node>, std::shared_ptr<ov::Node>, std::shared_ptr<ov::Node>>
         node_tuple;
@@ -470,7 +537,9 @@ ov::pass::StateManagementPattern::StateManagementPattern(PaParams& pa_params,
     };
 
     auto scale_input = any_input(scale_predicate);
-    auto sinks = any_input(ov::pass::pattern::has_static_shape() && ov::pass::pattern::rank_equals(4));
+    // A constant sink per head (gpt-oss, [1, num_heads, 1, 1]) or a sink per query token and head computed in the
+    // model (Inkling 2, [batch, num_heads, query_len, 1])
+    auto sinks = any_input(ov::pass::pattern::rank_equals(4));
 
     std::shared_ptr<ov::Node> k_to_sdpa =
         std::make_shared<Or>(OutputVector{k_concat, k_shaped, k_shaped_transposed, k_simply_shaped});
@@ -482,7 +551,11 @@ ov::pass::StateManagementPattern::StateManagementPattern(PaParams& pa_params,
     k_to_sdpa = optional_quantization(k_to_sdpa);
     v_to_sdpa = optional_quantization(v_to_sdpa);
 
-    auto mask_to_sdpa = std::make_shared<Or>(OutputVector{phi3_mask,
+    // Inkling 2: a per-token relative position bias on top of a sliding window (gemma4 form) or full attention mask
+    RelativeBiasTablePattern relative_bias(std::make_shared<Or>(OutputVector{gemma4_mask, any_input()}));
+
+    auto mask_to_sdpa = std::make_shared<Or>(OutputVector{relative_bias.mask,
+                                                          phi3_mask,
                                                           general_alibi_mask,
                                                           jais_alibi_mask,
                                                           baichuan2_13b_alibi_mask,
@@ -683,7 +756,13 @@ ov::pass::StateManagementPattern::StateManagementPattern(PaParams& pa_params,
         }
 
         std::shared_ptr<Node> alibi_slopes;
-        if (pattern_map.count(general_alibi)) {
+        if (pattern_map.count(relative_bias.mask)) {
+            // A bias that does not have the expected form cannot be dropped: the attention is left as it is
+            alibi_slopes = relative_bias.get_table(pattern_map);
+            if (!alibi_slopes) {
+                return false;
+            }
+        } else if (pattern_map.count(general_alibi)) {
             alibi_slopes = handle_general_alibi(pattern_map.at(general_alibi).get_node_shared_ptr());
         } else if (pattern_map.count(jais_13b_alibi)) {
             alibi_slopes = handle_jais_13b_alibi(pattern_map.at(jais_13b_alibi).get_node_shared_ptr());
@@ -801,8 +880,19 @@ ov::pass::StateManagementPattern::StateManagementPattern(PaParams& pa_params,
         // as there's going to be num_q_heads at -3.
         if (pattern_map.count(sinks)) {
             const auto& sinks_val = pattern_map.at(sinks);
-            if (sinks_val.get_partial_shape()[-3] == real_q.get_partial_shape()[-3]) {
-                pa_arguments.insert(pa_arguments.begin() + 20, sinks_val.get_node_shared_ptr());
+            const auto& sinks_shape = sinks_val.get_partial_shape();
+            if (sinks_shape[-3].is_static() && sinks_shape[-3] == real_q.get_partial_shape()[-3]) {
+                if (sinks_shape.is_static()) {
+                    pa_arguments.insert(pa_arguments.begin() + 20, sinks_val.get_node_shared_ptr());
+                } else {
+                    // A sink per query token: in the PagedAttention form every token is a batch element with a query
+                    // length of 1, so the sinks are [batch (tokens), num_heads, 1, 1]
+                    const auto sinks_per_token = std::make_shared<v1::Reshape>(
+                        sinks_val,
+                        v0::Constant::create(element::i64, Shape{4}, {int64_t{-1}, sinks_shape[-3].get_length(), int64_t{1}, int64_t{1}}),
+                        false);
+                    pa_arguments.insert(pa_arguments.begin() + 20, sinks_per_token);
+                }
             } else {
                 pa_arguments.insert(pa_arguments.begin() + 20,
                                     v0::Constant::create(real_q.get_element_type(), Shape{0, 0, 0, 0}, {}));
