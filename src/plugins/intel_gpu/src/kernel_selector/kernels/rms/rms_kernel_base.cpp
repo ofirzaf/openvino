@@ -24,6 +24,15 @@ bool RMSKernelBase::Validate(const Params& p) const {
         DO_NOT_USE_THIS_KERNEL(p.layerID);
     }
 
+    // The clip limits the scale `gamma * rsqrt(mean)` to 1: one positive gamma for the whole tensor, floating-point data.
+    if (params.clip) {
+        const auto input_dt = params.inputs[0].GetDType();
+        const bool real_input = input_dt == Datatype::F32 || input_dt == Datatype::F16 || input_dt == Datatype::BF16;
+        if (!real_input || !params.elementwise_affine || params.inputs[1].is_dynamic() || params.inputs[1].LogicalSize() != 1) {
+            DO_NOT_USE_THIS_KERNEL(p.layerID);
+        }
+    }
+
     return true;
 }
 
@@ -33,6 +42,7 @@ JitConstants RMSKernelBase::GetJitConstants(const rms_params& params, RMSKernelB
     const auto normalization_axis = GetNormalizationAxis(params);
     jit.AddConstant(MakeJitConstant("EPSILON", params.epsilon));
     jit.AddConstant(MakeJitConstant("ELEMENTWISE_AFFINE", params.elementwise_affine));
+    jit.AddConstant(MakeJitConstant("RMS_CLIP", params.clip));
     jit.AddConstant(MakeJitConstant("INPUT_RANK", params.ov_input_rank));
     jit.AddConstants({
         MakeJitConstant("NORMALIZE_BATCH", normalization_axis == Tensor::DataChannelName::BATCH),

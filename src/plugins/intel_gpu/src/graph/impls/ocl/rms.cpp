@@ -43,6 +43,7 @@ struct rms_impl : typed_primitive_impl_ocl<rms> {
         params.ov_input_rank = static_cast<int32_t>(impl_param.get_input_layout().get_partial_shape().size());
         params.elementwise_affine = primitive->elementwise_affine;
         params.axis = primitive->axis;
+        params.clip = primitive->clip;
         return params;
     }
 

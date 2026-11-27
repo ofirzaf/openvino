@@ -624,6 +624,126 @@ TEST(rms_gpu_test, rms_test_bfyx_opt_dyn) {
     }
 }
 
+// Clip mode: `x * min(1, gamma * rsqrt(mean(x^2) + epsilon))` along the last axis, with a scalar gamma.
+// Rows with a root mean square below, at and far above gamma, and a zero row. The values of a row alternate in sign and
+// differ in magnitude, so a wrong scale shows in every element. The plain normalization (the same primitive without the
+// clip) must be far from the reference, or the test would not see the flag.
+template <typename T>
+static void run_rms_clip(const std::string& kernel_name, data_types data_type, bool dynamic, int64_t hidden_size, float tolerance) {
+    auto& engine = get_test_engine();
+
+    constexpr float gamma_value = 2.0f;
+    constexpr float epsilon = 1e-12f;
+    const std::vector<float> row_scales = {0.0f, 0.01f, 0.5f, 1.0f, 1.9f, 2.0f, 2.1f, 4.0f, 16.0f, 64.0f, 200.0f, 1.3f};
+    const ov::PartialShape input_shape{1, 3, 4, hidden_size};
+    auto input_layout_dynamic = layout{ov::PartialShape{-1, -1, 4, hidden_size}, data_type, format::bfyx};
+    auto input = engine.allocate_memory({input_shape, data_type, format::bfyx});
+    auto gamma = engine.allocate_memory({ov::PartialShape{1}, data_type, format::bfyx});
+    ASSERT_EQ(input->count(), row_scales.size() * static_cast<size_t>(hidden_size));
+
+    std::vector<T> input_values(input->count());
+    std::vector<float> expected(input->count());
+    std::vector<float> normalized(input->count());
+    for (size_t row = 0; row < row_scales.size(); ++row) {
+        double mean_square = 0.0;
+        for (int64_t index = 0; index < hidden_size; ++index) {
+            const float value = row_scales[row] * (static_cast<float>((index * 5 + static_cast<int64_t>(row)) % 7) - 3.0f) / 2.0f;
+            input_values[row * hidden_size + index] = static_cast<T>(value);
+            // the reference reads the values the kernel reads (rounded to T)
+            const double stored = static_cast<double>(static_cast<float>(input_values[row * hidden_size + index]));
+            mean_square += stored * stored;
+        }
+        mean_square /= static_cast<double>(hidden_size);
+        const double scale = gamma_value / std::sqrt(mean_square + epsilon);
+        for (int64_t index = 0; index < hidden_size; ++index) {
+            const double stored = static_cast<double>(static_cast<float>(input_values[row * hidden_size + index]));
+            expected[row * hidden_size + index] = static_cast<float>(stored * std::min(1.0, scale));
+            normalized[row * hidden_size + index] = static_cast<float>(stored * scale);
+        }
+    }
+    set_values(input, input_values);
+    set_values(gamma, std::vector<T>{static_cast<T>(gamma_value)});
+
+    for (const bool clip : {true, false}) {
+        topology topology;
+        topology.add(input_layout("input", dynamic ? input_layout_dynamic : input->get_layout()));
+        topology.add(data("gamma", gamma));
+        auto rms_prim = rms("rms", input_info("input"), input_info("gamma"), epsilon);
+        rms_prim.clip = clip;
+        topology.add(rms_prim);
+
+        ExecutionConfig config = get_test_default_config(engine);
+        config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+        config.set_property(ov::intel_gpu::force_implementations(ov::intel_gpu::ImplForcingMap{{"rms", {format::bfyx, kernel_name}}}));
+        network network(engine, topology, config);
+        network.set_input_data("input", input);
+
+        auto impl = network.get_primitive("rms")->get_impl();
+        ASSERT_NE(impl, nullptr);
+        ASSERT_EQ(impl->is_dynamic(), dynamic);
+        ASSERT_EQ(impl->get_kernel_name(), kernel_name);
+
+        auto output = network.execute().at("rms").get_memory();
+        cldnn::mem_lock<T, mem_lock_type::read> output_ptr(output, get_test_stream());
+        ASSERT_EQ(output->count(), expected.size());
+        float largest_difference_to_clip = 0.0f;
+        for (size_t index = 0; index < expected.size(); ++index) {
+            const float result = static_cast<float>(output_ptr[index]);
+            const float allowed = tolerance * std::max(1.0f, std::abs(expected[index]));
+            largest_difference_to_clip = std::max(largest_difference_to_clip, std::abs(result - expected[index]));
+            if (clip) {
+                EXPECT_NEAR(result, expected[index], allowed)
+                    << kernel_name << " hidden_size=" << hidden_size << " row=" << index / hidden_size << " index=" << index % hidden_size;
+            } else {
+                EXPECT_NEAR(result, normalized[index], tolerance * std::max(1.0f, std::abs(normalized[index])))
+                    << kernel_name << " without clip, hidden_size=" << hidden_size << " row=" << index / hidden_size;
+            }
+        }
+        if (!clip) {
+            // control: without the flag the same primitive is far from the clip reference
+            EXPECT_GT(largest_difference_to_clip, 1.0f) << kernel_name << " hidden_size=" << hidden_size;
+        }
+    }
+}
+
+TEST(rms_gpu_test, rms_clip_bfyx_opt) {
+    for (const int64_t hidden_size : {16, 128}) {
+        for (const bool dynamic : {false, true}) {
+            run_rms_clip<float>("rms_gpu_bfyx_opt", data_types::f32, dynamic, hidden_size, 1e-4f);
+            run_rms_clip<ov::float16>("rms_gpu_bfyx_opt", data_types::f16, dynamic, hidden_size, 2e-3f);
+        }
+    }
+}
+
+TEST(rms_gpu_test, rms_clip_bfyx_ref) {
+    for (const int64_t hidden_size : {16, 128}) {
+        for (const bool dynamic : {false, true}) {
+            run_rms_clip<float>("rms_gpu_ref", data_types::f32, dynamic, hidden_size, 1e-4f);
+            run_rms_clip<ov::float16>("rms_gpu_ref", data_types::f16, dynamic, hidden_size, 2e-3f);
+        }
+    }
+}
+
+TEST(rms_gpu_test, rms_clip_needs_scalar_gamma) {
+    auto& engine = get_test_engine();
+    auto input = engine.allocate_memory({ov::PartialShape{1, 2, 128}, data_types::f32, format::bfyx});
+    auto gamma = engine.allocate_memory({ov::PartialShape{1, 1, 128}, data_types::f32, format::bfyx});
+    tests::set_random_values<float>(input, true, 8, 100);
+    tests::set_random_values<float>(gamma, true, 8, 10);
+
+    topology topology;
+    topology.add(input_layout("input", input->get_layout()));
+    topology.add(data("gamma", gamma));
+    auto rms_prim = rms("rms", input_info("input"), input_info("gamma"), 1e-6f);
+    rms_prim.clip = true;
+    topology.add(rms_prim);
+
+    ExecutionConfig config = get_test_default_config(engine);
+    config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+    // no kernel takes a per-element gamma in clip mode: building the network fails instead of normalizing silently
+    EXPECT_ANY_THROW(network(engine, topology, config));
+}
+
 TEST(rms_gpu_test, rms_test_bfyx_opt_fused_eltwise_f16_dyn) {
     auto& engine = get_test_engine();
 

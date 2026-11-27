@@ -60,6 +60,10 @@ KERNEL(rms_gpu_ref)(
 
             rms /= NORM_SIZE;
             rms = pow(sqrt(rms + EPSILON), -1);
+#if RMS_CLIP
+            // Clip: every element below is `rms * input * gamma`; limiting rms keeps that scale at 1 or less.
+            rms = fmin(rms, (ACCUMULATOR_TYPE)1 / TO_ACCUMULATOR_TYPE(gamma[INPUT1_OFFSET]));
+#endif
 
             for (uint n = 0; n < NORM_SIZE; n++) {
                 NORM_INDEX = n;

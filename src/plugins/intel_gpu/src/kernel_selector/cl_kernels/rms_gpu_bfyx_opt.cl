@@ -171,6 +171,10 @@ KERNEL(rms_gpu_bfyx_opt)(
 
 #if ELEMENTWISE_AFFINE && RMS_GAMMA_IS_SCALAR
     const ACCUMULATOR_TYPE gamma_scalar = TO_ACCUMULATOR_TYPE(gamma[0]);
+#if RMS_CLIP
+    // Clip: every element below is `rms * data * gamma_scalar`; limiting rms keeps that scale at 1 or less.
+    rms = fmin(rms, (ACCUMULATOR_TYPE)1 / gamma_scalar);
+#endif
 #endif
 
     #if HAS_FUSED_OPS && !RMS_FEATURE_AXIS

@@ -150,6 +150,7 @@
 #include "plugin/transformations/increase_rms_input_precision.hpp"
 #include "plugin/transformations/force_fp32_selective.hpp"
 #include "plugin/transformations/l2_norm_to_rms.hpp"
+#include "plugin/transformations/rms_clip_fusion.hpp"
 #include "transformations/common_optimizations/activations_scaling.hpp"
 #include "transformations/common_optimizations/broadcast_elementwise_fusion.hpp"
 #include "transformations/common_optimizations/broadcast_transition.hpp"
@@ -1227,6 +1228,8 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
             return static_cast<int32_t>((gamma_shape.back() / vec_size)) > static_cast<int32_t>(device_info.max_work_group_size);
         });
         manager.register_pass<ov::pass::RMSFusion>(false, true, true);
+        // An RMS followed by a per-element choice between the input and the normalized value is a clip: one primitive.
+        manager.register_pass<ov::intel_gpu::RMSClipFusion>();
         manager.register_pass<ov::intel_gpu::FoldRMSTransposes>();
         manager.register_pass<DisableFP16CompForGemma3RMSPattern>();
         const bool fp16_activation_scaling_enabled =

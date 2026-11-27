@@ -16,6 +16,7 @@ struct rms_params : public base_params {
     int32_t ov_input_rank = -1;
     int64_t axis = -1;
     bool elementwise_affine = true;
+    bool clip = false;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////

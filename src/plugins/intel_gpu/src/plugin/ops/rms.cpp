@@ -5,9 +5,14 @@
 #include "intel_gpu/plugin/program_builder.hpp"
 #include "intel_gpu/plugin/common_utils.hpp"
 #include "intel_gpu/primitives/rms.hpp"
+#include "intel_gpu/op/rms_clip.hpp"
 #include <ov_ops/rms.hpp>
 
 using RMS = ov::op::internal::RMS;
+
+namespace ov::op::internal {
+using RMSClip = ov::intel_gpu::op::RMSClip;
+}
 
 namespace ov::intel_gpu {
 
@@ -24,6 +29,16 @@ static void CreateRMSOp(ProgramBuilder& p, const std::shared_ptr<RMS>& op) {
     p.add_primitive(*op, rms);
 }
 
+static void CreateRMSClipOp(ProgramBuilder& p, const std::shared_ptr<ov::op::internal::RMSClip>& op) {
+    validate_inputs_count(op, {2});
+    auto inputs = p.GetInputInfo(op);
+    auto rms = cldnn::rms(layer_type_name_ID(op), inputs[0], inputs[1], static_cast<float>(op->get_epsilon()));
+    rms.clip = true;
+    rms.output_data_types = get_output_data_types(op);
+    p.add_primitive(*op, rms);
+}
+
 REGISTER_FACTORY_IMPL(internal, RMS);
+REGISTER_FACTORY_IMPL(internal, RMSClip);
 
 }  // namespace ov::intel_gpu

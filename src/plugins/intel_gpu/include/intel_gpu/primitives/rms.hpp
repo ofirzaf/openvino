@@ -49,11 +49,16 @@ struct rms : public primitive_base<rms> {
     /// @brief Logical input axis normalized by RMS
     int64_t axis = -1;
 
+    /// @brief Clip instead of normalization: the scale is limited to 1, `x * min(1, gamma * rsqrt(mean(x^2) + epsilon))`,
+    /// so only a row with a root mean square above gamma is scaled (down to gamma). Needs a positive scalar gamma.
+    bool clip = false;
+
     size_t hash() const override {
         size_t seed = primitive::hash();
         seed = hash_combine(seed, epsilon);
         seed = hash_combine(seed, elementwise_affine);
         seed = hash_combine(seed, axis);
+        seed = hash_combine(seed, clip);
         return seed;
     }
 
@@ -66,7 +71,8 @@ struct rms : public primitive_base<rms> {
 
         return epsilon == rhs_casted.epsilon &&
                elementwise_affine == rhs_casted.elementwise_affine &&
-               axis == rhs_casted.axis;
+               axis == rhs_casted.axis &&
+               clip == rhs_casted.clip;
     }
 
     void save(BinaryOutputBuffer& ob) const override {
@@ -74,6 +80,7 @@ struct rms : public primitive_base<rms> {
         ob << epsilon;
         ob << elementwise_affine;
         ob << axis;
+        ob << clip;
     }
 
     void load(BinaryInputBuffer& ib) override {
@@ -81,6 +88,7 @@ struct rms : public primitive_base<rms> {
         ib >> epsilon;
         ib >> elementwise_affine;
         ib >> axis;
+        ib >> clip;
     }
 };
 }  // namespace cldnn
